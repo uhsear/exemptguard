@@ -33,7 +33,7 @@ Exit codes: 0 no row matched, and at most half the rows had no street line to
 check (a dataset with no rows at all also exits 0), 1 at least one row matched
 (publish the --out file, not the input), 2 a file could not be read or written,
 3 refused (the roster is damaged or the key does not open it), 4 too little was
-checked (more than half the rows had no street line) or nothing was built, 64
+checked (more than half the rows had no street line) or too little was built, 64
 usage error, 70 an unexpected crash, which is never a finding.
 """
 
@@ -63,7 +63,7 @@ import unicodedata
 # Bump this when any table below changes. A roster records the version it was
 # built with, and a different version is refused, because the same address
 # would hash to a different value and the roster would silently match less.
-NORMALIZER_VERSION = 1
+NORMALIZER_VERSION = 2
 
 # The shortest key file accepted, in bytes. A short key can be guessed, and a
 # guessed key turns the roster back into a list.
@@ -160,8 +160,8 @@ EXTRA_ROWS = (
     "HNGR HANGER", "RM ROOM", "SPC SPACE", "STE SUITE", "OFC OFFICE",
     "PH PENTHOUSE", "BSMT BASEMENT", "LBBY LOBBY", "LOWR LOWER",
     "UPPR UPPER", "FRNT FRONT", "ST SAINT",
-    "1ST FIRST", "2ND SECOND", "3RD THIRD", "4TH FOURTH", "5TH FIFTH",
-    "6TH SIXTH", "7TH SEVENTH", "8TH EIGHTH", "9TH NINTH", "10TH TENTH",
+    "1 FIRST", "2 SECOND", "3 THIRD", "4 FOURTH", "5 FIFTH",
+    "6 SIXTH", "7 SEVENTH", "8 EIGHTH", "9 NINTH", "10 TENTH",
 )
 
 # Secondary unit designators (Publication 28, Appendix C2), as folded above.
@@ -194,6 +194,10 @@ _DECIMAL = re.compile(r"^\s*([0-9]+)\.0+(?=\s|$)")
 # A column name that is safe to print: words that start with a letter.
 _NAME = re.compile(r"^(?=.{1,40}$)[A-Za-z_][A-Za-z0-9_.-]*"
                    r"( [A-Za-z_][A-Za-z0-9_.-]*)*$")
+# 5TH, 22ND: the ordinal ending is dropped from a numbered street, so NW 5TH ST
+# and NW 5 ST are one street line. The house number (first word) is exempt.
+_ORDINAL = re.compile(r"^([0-9]+)(?:ST|ND|RD|TH)$")
+_NORMALIZER = re.compile(r"^normalizer ([0-9]+)$")
 _ATTACHED = re.compile(r"^([A-Z]+)([0-9][0-9A-Z]*)$")
 _BREAK = re.compile(r"\r\n|\r|\n")
 _HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -234,7 +238,8 @@ def normalize(text):
     flattened. Everything after the first comma is dropped. An apostrophe is
     deleted (O'BRIEN is OBRIEN), N.W. is NW, and a house number written 412.0
     is 412. Suffixes, directionals and unit words are folded to one spelling,
-    a unit is cut off, and leading zeros are removed from the house number.
+    an ordinal ending is dropped (5TH is 5), a unit is cut off, and leading
+    zeros are removed from the house number.
     """
     if not text:
         return ()
@@ -250,6 +255,7 @@ def normalize(text):
         else:
             words.append(word)
     words = [FOLD.get(w, w) for w in words]
+    words = words[:1] + [_ORDINAL.sub(r"\1", w) for w in words[1:]]
     if words and words[0].isdigit():
         words[0] = words[0].lstrip("0") or "0"
     return tuple(_strip_unit(words))
@@ -320,10 +326,14 @@ def parse_roster(text, key):
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     if len(lines) < 4 or lines[0] != ROSTER_MAGIC:
         raise ValueError("this file is not an exemptguard roster")
-    if lines[1] != "normalizer %d" % NORMALIZER_VERSION:
+    # Only digits are echoed: the line is free text in a damaged roster.
+    version = _NORMALIZER.match(lines[1])
+    if not version:
+        raise ValueError("the roster header is damaged")
+    if int(version.group(1)) != NORMALIZER_VERSION:
         raise ValueError("the roster was built with a different address "
-                         "normalizer (%r, this tool is %d). Rebuild it."
-                         % (lines[1], NORMALIZER_VERSION))
+                         "normalizer (%s, this tool is %d). Rebuild it."
+                         % (version.group(1), NORMALIZER_VERSION))
     stored = _CHECK.match(lines[2])
     counted = _COUNT.match(lines[3])
     if not stored or not counted:
@@ -442,9 +452,14 @@ def screen(rows, compiled, key, digests):
     return report
 
 
+def too_many(part, whole):
+    """True when part is more than MAX_UNCHECKED_PERCENT of whole."""
+    return part * 100 > MAX_UNCHECKED_PERCENT * whole
+
+
 def too_little(report):
     """True when more than MAX_UNCHECKED_PERCENT of the rows were not checked."""
-    return len(report.unchecked) * 100 > MAX_UNCHECKED_PERCENT * report.rows
+    return too_many(len(report.unchecked), report.rows)
 
 
 def gate(report):
@@ -456,29 +471,39 @@ def gate(report):
     return 0
 
 
-def carries_more(words):
-    """True when a roster line goes on after its street suffix.
+def street_end(words):
+    """A roster line cut after its street suffix, or the words unchanged.
 
-    The roster side is hashed whole, so a city after the suffix
-    (412 LARKSPUR LN FAIRVIEW) matches only a dataset line that carries the
-    same city. A direction or another suffix after the first suffix is normal
-    (12 OAK ST NE) and is not counted.
+    The dataset side is tried by prefix, so a roster line must stop where the
+    street stops. A city after the suffix (412 LARKSPUR LN FAIRVIEW) would
+    otherwise match only a dataset line that carries the same city. A direction
+    or another suffix after the first suffix is part of the street
+    (12 OAK ST NE, 5 PARK AVE). A cut in the wrong place leaves a shorter
+    entry, which holds more rows, not fewer.
     """
     for i in range(2, len(words)):
         if words[i] in _SUFFIXES:
-            return any(w not in _SUFFIXES and w not in _DIRECTIONS
-                       for w in words[i + 1:])
-    return False
+            end = i + 1
+            while end < len(words) and (words[end] in _SUFFIXES
+                                        or words[end] in _DIRECTIONS):
+                end += 1
+            return words[:end]
+    return words
+
+
+def carries_more(words):
+    """True when a roster line goes on after its street suffix."""
+    return len(street_end(words)) < len(words)
 
 
 def build_digests(rows, compiled, key):
     """Hashes for a roster from plain rows: (set, unusable lines, two-word n,
-    long n).
+    cut n).
 
     A row with no street line is listed, not dropped without a word. A
     two-word key matches every dataset address that starts with those two
-    words, and a long one (see carries_more) may match nothing, so both are
-    counted.
+    words, and a line that went on after its suffix is cut (see street_end),
+    so both are counted.
     """
     base = hasher(key)
     found = set()
@@ -491,11 +516,12 @@ def build_digests(rows, compiled, key):
             words = cell_words(cells, positions)
             if addressable(words):
                 usable = True
-                found.add(digest(base, words))
+                cut = street_end(words)
+                found.add(digest(base, cut))
                 if len(words) == 2:
                     short.add(digest(base, words))
-                if carries_more(words):
-                    long_.add(digest(base, words))
+                if len(cut) < len(words):
+                    long_.add(digest(base, cut))
         if not usable:
             unusable.append(line)
     return found, unusable, len(short), len(long_)
@@ -562,10 +588,10 @@ def describe_build(count, entries, unusable, short, sample=DEFAULT_SAMPLE,
                    "dataset address that starts with the same two words."
                    % short)
     if long_:
-        out.append("entries that go on after the street suffix: %d. The "
-                   "roster side is hashed whole, so each one matches only a "
-                   "dataset line with the same extra words. Cut it to the "
-                   "street line." % long_)
+        out.append("entries that went on after the street suffix: %d. Each "
+                   "is cut at the suffix, so the roster holds the street line "
+                   "only. A cut in the wrong place holds more rows, not fewer."
+                   % long_)
     return out
 
 
@@ -707,6 +733,15 @@ def _no_clash(outputs, inputs):
                       "replace the first." % (flag, other_flag), 64)
 
 
+def _verb(path):
+    """'replaced' when --apply is about to overwrite a file, else 'wrote'.
+
+    An output that is not an input is replaced without a question, so a
+    nightly rerun can reuse its names. The word keeps that from being silent.
+    """
+    return "replaced" if os.path.exists(path) else "wrote"
+
+
 def _make_key(args):
     if not args.apply:
         print("Check only. %s was not written. Re-run with --apply."
@@ -748,12 +783,19 @@ def _build(args):
         print("\nVERDICT: NOTHING BUILT. No row had a street line, and an "
               "empty roster blocks nothing. Look for a wrong column.")
         return 4
+    if too_many(len(unusable), len(rows)):
+        print("\nVERDICT: TOO LITTLE BUILT. Only %d of %d plain row(s) had a "
+              "street line, so the roster would leave most of the list out. "
+              "Nothing written. Look for a wrong column."
+              % (len(rows) - len(unusable), len(rows)))
+        return 4
     if args.apply:
+        verb = _verb(args.roster)
         try:
             write_roster(args.roster, key, found)
         except (IOError, OSError) as exc:
             return _stop("could not write %s: %s" % (args.roster, exc), 2)
-        print("\nwrote %s" % args.roster)
+        print("\n%s %s" % (verb, args.roster))
     else:
         print("\nCheck only. %s was not written. Re-run with --apply."
               % args.roster)
@@ -789,6 +831,7 @@ def _screen(args):
               "would look like a clean one.")
     elif outputs:
         for flag, path in outputs:
+            verb = _verb(path)
             try:
                 if flag == "--out":
                     write_clean(path, header, rows, report)
@@ -798,7 +841,7 @@ def _screen(args):
                 # A traceback would exit 1, which a scheduled job reads as
                 # "a row matched". A failed write is a different fact.
                 return _stop("could not write %s: %s" % (path, exc), 2)
-            print("\nwrote %s" % path)
+            print("\n%s %s" % (verb, path))
     return code
 
 
@@ -968,7 +1011,7 @@ def _self_test(tmp):
     check(N("412 Larkspur Lane") == ("412", "LARKSPUR", "LN"),
           "a spelled-out suffix folds to the Publication 28 abbreviation")
     check(N("88 North Quill Street") == ("88", "N", "QUILL", "ST")
-          and N("5 Southwest 3rd Ave") == ("5", "SW", "3RD", "AVE"),
+          and N("5 Southwest 3rd Ave") == ("5", "SW", "3", "AVE"),
           "a spelled-out directional folds to its letters")
     check(N("88 N. Quill St, Apt 3, Fairview FL 33000") == N("88 N Quill St"),
           "everything after the first comma is dropped")
@@ -984,7 +1027,7 @@ def _self_test(tmp):
           "a state and ZIP code after the street are cut with the FL")
     check(N("12 O'Brien Rd") == N("12 OBRIEN RD") == ("12", "OBRIEN", "RD")
           and N("123 N.W. 5th St") == N("123 NW 5th St")
-          == ("123", "NW", "5TH", "ST")
+          == ("123", "NW", "5", "ST")
           and N("5 S.E. Oak St") == ("5", "SE", "OAK", "ST")
           and N("412.0 Larkspur Lane") == N("412.00 Larkspur Ln")
           == ("412", "LARKSPUR", "LN")
@@ -997,6 +1040,8 @@ def _self_test(tmp):
     check(N("412 Larkspur Ln, Fairview") == ("412", "LARKSPUR", "LN"),
           "a city after a comma is dropped")
     check(addressable(("12", "OAK")) and addressable(("0", "A"))
+          and addressable(N("412A Larkspur Ln"))
+          and addressable(("4A", "OAK"))
           and not addressable(("NO", "SITUS", "ADDRESS"))
           and not addressable(("LARKSPUR", "LN")) and not addressable(("12",))
           and not addressable(()),
@@ -1014,6 +1059,17 @@ def _self_test(tmp):
     check(N("5 Fifth Ave") == N("5 5th Ave") and N("5 Saint Johns Rd")
           == N("5 St Johns Rd"),
           "ordinal words and SAINT fold to one spelling")
+    check(N("412 NW 5th Street") == N("412 NW 5 ST") == N("412 NW Fifth St")
+          == ("412", "NW", "5", "ST")
+          and N("412 SE 17th Ave") == N("412 SE 17 AVE")
+          and N("22 2nd Ave") == N("22 2 Ave") and N("5th Oak St")[0] == "5TH",
+          "a numbered street written with and without its ordinal ending "
+          "is one street line, and the house number is left alone  "
+          "<-- pinned defect")
+    check(N("12 Oak St Suite200") == base_line
+          and N("12 Oak St Apartment4") == base_line
+          and N("12 Oak St Suite 200") == base_line,
+          "a long-form unit joined to its number is split and cut")
     check(N("12 Oak\u00a0St") == base_line
           and N("\uff11\uff12 Oak St") == base_line,
           "a no-break space and full-width digits read as plain text  "
@@ -1049,6 +1105,10 @@ def _self_test(tmp):
               for p in prefixes((str(n), "LARKSPUR", "LN"))]
           and ("412", "LARKSPUR", "LN") in candidates(
               ("414", "410", "LARKSPUR", "LN"))
+          and ("411", "LARKSPUR", "LN") in candidates(
+              ("410", "411", "LARKSPUR", "LN"))
+          and ("411", "LARKSPUR", "LN") in candidates(
+              ("409", "411", "LARKSPUR", "LN"))
           and candidates(("410", "410", "A", "B")) == prefixes(
               ("410", "410", "A", "B"))
           and candidates(("410", "414")) == prefixes(("410", "414"))
@@ -1116,10 +1176,15 @@ def _self_test(tmp):
            "a file with another magic line is refused")
     raises(lambda: parse_roster("hello\n", key),
            "a file that is not a roster is refused")
-    raises(lambda: parse_roster(text.replace("normalizer 1", "normalizer 9"),
-                                key),
-           "a roster from another normalizer version is refused  "
-           "<-- pinned defect")
+    raises(lambda: parse_roster(
+        text.replace("normalizer %d" % NORMALIZER_VERSION, "normalizer 9"),
+        key),
+        "a roster from another normalizer version is refused  "
+        "<-- pinned defect")
+    raises(lambda: parse_roster(
+        text.replace("normalizer %d" % NORMALIZER_VERSION, "normalizer x"),
+        key),
+        "a roster whose normalizer line is not a version is refused")
     raises(lambda: parse_roster(text.replace("check ", "chunk "), key),
            "a damaged header line is refused")
     raises(lambda: parse_roster(text.replace("count 2", "count two"), key),
@@ -1129,6 +1194,46 @@ def _self_test(tmp):
           "a key keeps every byte but the line ending, and 16 bytes pass")
     raises(lambda: parse_key(b"x" * 15 + b"\n"),
            "a key of 15 bytes is refused")
+
+    # ---- the two README demos: why a plain hash and a raw-text hash fail
+    pool = ["%d Larkspur Ln" % n for n in range(1, 20001)]
+    target = N("412 Larkspur Lane")
+    plain_roster = {hashlib.sha256(" ".join(target).encode("ascii"))
+                    .hexdigest()}
+    keyed_roster = {digest(base, target)}
+
+    def attack(known, make):
+        return [a for a in pool if make(" ".join(N(a))) in known]
+
+    plain_found = attack(plain_roster, lambda t: hashlib.sha256(
+        t.encode("ascii")).hexdigest())
+    keyed_found = attack(keyed_roster, lambda t: hashlib.sha256(
+        t.encode("ascii")).hexdigest()) + attack(
+            keyed_roster, lambda t: hashlib.sha256(
+                ("addr:" + t).encode("ascii")).hexdigest())
+    check(plain_found == ["412 Larkspur Ln"] and keyed_found == [],
+          "a plain SHA-256 roster gives up its address to a search over a "
+          "public address list, and the keyed roster does not")
+    demo_plain = ["412 Larkspur Lane", "88 N. Quillfeather Street, Apt 3",
+                  "1500 Heron Pier Road", "21 Tamarack Court"]
+    demo_data = ["412 Larkspur Ln", "90 Birchwood Ct",
+                 "88 North Quillfeather St Unit B, Fairview FL 33000",
+                 "4120 Larkspur Ln", "100 Key West Ave",
+                 "21 Tamarack Ct Apt 2", ""]
+
+    def raw_hash(text):
+        mac = hasher(key)
+        mac.update(text.strip().upper().encode("ascii"))
+        return mac.hexdigest()
+
+    raw_roster = {raw_hash(a) for a in demo_plain}
+    demo_roster = frozenset(digest(base, N(a)) for a in demo_plain)
+    check(sum(raw_hash(a) in raw_roster for a in demo_data) == 0
+          and len(screen([(i + 2, [a]) for i, a in enumerate(demo_data)],
+                         compile_specs(["A"], ["A"]), key,
+                         demo_roster).hits) == 3,
+          "a keyed hash of the raw text matches 0 of the 7 demo rows, and "
+          "the folded hash holds 3")
 
     # ---- columns
     header = ["ID", "ADDNUM", "STNAME", "SITE", "SITE"]
@@ -1153,6 +1258,8 @@ def _self_test(tmp):
            "a column name that appears twice is refused  <-- pinned defect")
     raises(lambda: compile_specs(["ID,"], header),
            "an empty column name in a spec is refused")
+    raises(lambda: compile_specs([""], ["ID", ""]),
+           "an empty spec does not select a column with a blank name")
     check(cell_words(["412", "Larkspur", "Lane"], [0, 1, 2])
           == ("412", "LARKSPUR", "LN") and cell_words(["412"], [3]) == ()
           and cell_words(["", " "], [0, 1]) == (),
@@ -1196,9 +1303,28 @@ def _self_test(tmp):
     check(city_n == 1,
           "the build counts a roster entry that goes on after its suffix "
           "once  <-- pinned defect")
+    check(street_end(N("412 Larkspur Lane Fairview FL 33000"))
+          == ("412", "LARKSPUR", "LN")
+          and street_end(N("12 Oak St NE Fairview")) == ("12", "OAK", "ST", "NE")
+          and street_end(N("12 Oak Park Lane Fairview"))
+          == ("12", "OAK", "PARK", "LN")
+          and street_end(N("12 Oak St")) == ("12", "OAK", "ST")
+          and street_end(("12", "OAK")) == ("12", "OAK"),
+          "a roster line is cut after its street suffix, a direction or a "
+          "second suffix stays, and a line with no suffix is left whole")
     roster = frozenset(digest(base, w) for w in (
         ("412", "LARKSPUR", "LN"), ("88", "N", "QUILL", "ST")))
     spec1 = compile_specs(["A"], ["A"])
+    cut_found, _, _, cut_n = build_digests(
+        [(2, ["412 Larkspur Lane Fairview FL 34400"]),
+         (3, ["88 N Quill St Fairview FL 34400"])],
+        compile_specs(["HOME"], ["HOME"]), key)
+    check(cut_found == roster and cut_n == 2
+          and len(screen([(2, ["412 Larkspur Ln"]), (3, ["88 N Quill St"]),
+                          (4, ["90 Birchwood Ct"])], spec1, key,
+                         cut_found).hits) == 2,
+          "a roster built from lines that go on after the suffix finds a "
+          "dataset line that stops at the street  <-- pinned defect")
 
     def held(*addresses, **kw):
         rows = [(i + 2, [a]) for i, a in enumerate(addresses)]
@@ -1268,6 +1394,17 @@ def _self_test(tmp):
     check(gate(rep) == 4 and gate(rep50) == 0,
           "the limit is exact: 51 unchecked rows in 100 is exit 4 and 50 is "
           "not  <-- pinned defect")
+    check(gate(held(*(["90 Birchwood Ct"] * 99 + [""] * 101))) == 4
+          and gate(held(*(["90 Birchwood Ct"] * 100 + [""] * 100))) == 0,
+          "the limit scales with the row count: 101 unchecked rows in 200 is "
+          "exit 4 and 100 is not  <-- pinned defect")
+    check(_lines([1, 2, 3], 3) == "1, 2, 3"
+          and _lines([1, 2, 3], 2) == "1, 2 and 1 more"
+          and any("rows with no street line (a house number, then a word) in "
+                  "any named field: 3" == x for x in describe(held(
+                      "", "Vacant", "   "))),
+          "a list that fits --sample has no 'and N more', and the count of "
+          "rows with no street line is printed")
     rep = held("90 Birchwood Ct")
     check(gate(rep) == 0 and rep.checked == 1
           and "CLEAN. 1 of 1" in "\n".join(describe(rep)),
@@ -1324,7 +1461,7 @@ def _self_test(tmp):
           and len(describe_build(7, 4, [], 0, 0)) == 2,
           "the build report lists no lines at --sample 0 and prints no "
           "heading for a count of zero")
-    check(any("entries that go on after the street suffix: 3."
+    check(any("entries that went on after the street suffix: 3."
               in x for x in describe_build(7, 4, [], 0, 10, 3)),
           "the build report counts entries that go on after the suffix")
 
@@ -1559,6 +1696,23 @@ def _self_test(tmp):
     check(code == 2 and "could not write" in err and "VERDICT" in out,
           "a clean copy that cannot be written exits 2, and the verdict "
           "printed above it still reads")
+    keep = tmpfile("precious.txt", "PRECIOUS\n")
+    code, out, err = cli(run + sa + ["--out", keep, "--apply"])
+    check(code == 1 and "replaced %s" % keep in out and "wrote" not in out
+          and slurp(keep).startswith("PARCEL,"),
+          "an existing --out file is replaced, and the run says 'replaced' "
+          "instead of 'wrote'  <-- pinned defect")
+    keep2 = tmpfile("precious2.txt", "PRECIOUS\n")
+    code, out, err = cli(["--build-roster", plain_csv, "--address-field",
+                          "HOME_ADDR", "--roster", keep2, "--key-file",
+                          key_path, "--apply"])
+    check(code == 0 and "replaced %s" % keep2 in out,
+          "an existing roster file is replaced, and the run says so")
+    header_only = tmpfile("header-only.csv", "PARCEL,SITE_ADDR\n")
+    code, out, err = cli([header_only] + base_args + sa)
+    check(code == 0 and "VERDICT: CLEAN. 0 of 0 row(s)" in out,
+          "a dataset with a header and no rows exits 0, because it has "
+          "nothing to check")
     code, out, err = cli(run + sa + ["--sample", "-1"])
     check(code == 64 and "--sample" in err, "a negative --sample exits 64")
     code, out, err = cli([data_path] + sa + ["--key-file", key_path])
@@ -1639,6 +1793,59 @@ def _self_test(tmp):
                           "--sample", "0"])
     check(code == 0 and "entries of only two words: 1" in out,
           "a two-word entry is called out in the build report")
+    tail_csv = tmpfile("tail.csv", "ID,HOME\n1,412 Larkspur Ln Fairview FL "
+                       "34400\n2,88 N Quill St Fairview FL 34400\n")
+    tail_roster = path("tail-roster.txt")
+    tail_data = tmpfile("tail-data.csv", "PARCEL,SITE_ADDR\nP1,412 Larkspur "
+                        "Ln\nP2,88 N Quill St\nP3,90 Birchwood Ct\n")
+    code, out, err = cli(["--build-roster", tail_csv, "--address-field",
+                          "HOME", "--roster", tail_roster, "--key-file",
+                          key_path, "--apply"])
+    code2, out2, err2 = cli([tail_data, "--roster", tail_roster, "--key-file",
+                             key_path] + sa)
+    check(code == 0 and "entries that went on after the street suffix: 2" in out
+          and "VERDICT: roster of 2 entries" in out
+          and code2 == 1 and "rows held back: 2" in out2,
+          "a roster built from one-line addresses with a city and ZIP code "
+          "holds the street-only dataset lines, instead of reading as clean  "
+          "<-- pinned defect")
+    mostly_plain = tmpfile("mostly-plain.csv", "ID,HOME_ADDR\n1,412 Larkspur "
+                           "Lane\n" + "".join("%d,Vacant\n" % i
+                                              for i in range(2, 11)))
+    code, out, err = cli(["--build-roster", mostly_plain, "--address-field",
+                          "HOME_ADDR", "--roster", path("mostly-r.txt"),
+                          "--key-file", key_path, "--apply"])
+    check(code == 4 and "TOO LITTLE BUILT" in out
+          and "Only 1 of 10 plain row(s)" in out
+          and not os.path.exists(path("mostly-r.txt")),
+          "a plain list where most rows have no street line exits 4 and "
+          "writes no roster  <-- pinned defect")
+    half_rows = "".join("%d,%s\n" % (i, "12%d Elm St" % i if i < 5 else "-")
+                        for i in range(10))
+    half_ok = tmpfile("half-ok.csv", "ID,HOME_ADDR\n" + half_rows)
+    half_bad = tmpfile("half-bad.csv", "ID,HOME_ADDR\n" + half_rows.replace(
+        "4,124 Elm St", "4,-"))
+    code, out, err = cli(["--build-roster", half_ok, "--address-field",
+                          "HOME_ADDR", "--roster", path("half-r.txt"),
+                          "--key-file", key_path, "--apply"])
+    code2, out2, err2 = cli(["--build-roster", half_bad, "--address-field",
+                             "HOME_ADDR", "--roster", path("half-r2.txt"),
+                             "--key-file", key_path, "--apply"])
+    check(code == 0 and os.path.exists(path("half-r.txt"))
+          and code2 == 4 and not os.path.exists(path("half-r2.txt")),
+          "the build limit is exact: 5 unusable rows in 10 builds, 6 do not")
+    odd = tmpfile("odd.txt", "\n".join(roster_file.splitlines()[:1]
+                                       + ["412 LARKSPUR LANE, FAIRVIEW"]
+                                       + roster_file.splitlines()[2:]) + "\n")
+    code, out, err = cli([data_path, "--roster", odd, "--key-file", key_path]
+                         + sa)
+    check(code == 3 and "damaged" in out and "LARKSPUR" not in out + err,
+          "a roster whose normalizer line holds text is refused without "
+          "printing that text  <-- pinned defect")
+    code, out, err = cli(["--build-roster", plain_csv, "--address-field",
+                          "HOME_ADDR"] + base_args)
+    check(code == 0 and "VERDICT: roster of 4 entries." in out,
+          "the build verdict states the number of entries")
 
     # ---- the key file
     new_key = path("fresh.bin")

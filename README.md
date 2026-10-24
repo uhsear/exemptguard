@@ -15,23 +15,26 @@ of it is a phone call.
 
 The defence everybody reaches for first is a hashed list. Hash every exempt address, send the
 hashes, and compare. It looks safe, and it is not. Every address in a county is public, so an
-attacker hashes every address and reads the roster back. On this workstation, one plain SHA-256
-search over 1,000,000 candidate addresses found the planted address in 1.44 seconds. On an Ubuntu
-server it took 0.72 seconds. The same search against a keyed hash (HMAC-SHA256) of the same
-address found nothing, because the key was not known. The key is what makes the roster safe to
-hand over. This tool uses the key and keeps the key out of the roster.
+attacker hashes every address and reads the roster back. The self-test runs that attack on 20,000
+synthetic candidate addresses. A search against a plain SHA-256 roster finds the planted address.
+The same search against a keyed hash (HMAC-SHA256) of the same address finds nothing, because the
+key is not known. A larger search over 1,000,000 candidates found the plain hash in 1.44 seconds
+on a Windows workstation and 0.72 seconds on an Ubuntu server. That larger run was measured once
+and no script for it is in this repository. The key is what makes the roster safe to hand over.
+This tool uses the key and keeps the key out of the roster.
 
 Hashing raw text fails the other way. The roster says `412 Larkspur Lane`. The dataset says
 `412 Larkspur Ln`. The two hashes differ, and every row passes. In the demo below, a keyed hash
 of the raw text, even after upper-casing and trimming it, matched 0 of 7 dataset rows, and three
-of them are on the roster. This tool
+of them are on the roster (the self-test pins both numbers). This tool
 folds both sides to one spelling first: case, punctuation, `Lane` and `Ln`, `North` and `N`,
-`Apt 4` and `#4`, and a trailing city and ZIP code.
+`Apt 4` and `#4`, `5th` and `5`, and a trailing city and ZIP code.
 
 The quietest failure is a check that ran and compared nothing. The wrong key matches no row. A
 roster cut short in transit matches only part of the list. An address column with the wrong name,
 or empty, gives nothing to compare. Each of them reads as a clean dataset to a scheduled job.
-This tool refuses the first two with exit 3 and the last with exit 4.
+This tool refuses the first two with exit 3 and the last with exit 4. It also refuses to build a
+roster from a plain list where most rows have no street line.
 
 ```
 $ python exemptguard.py --self-test
@@ -41,6 +44,7 @@ PASS  case, punctuation and the suffix spellings fold to one street line
 ...
 PASS  every unit spelling is cut off, including #4 and APT4  <-- pinned defect
 PASS  KEY, PIER, SIDE and STOP in a street name are not read as a unit  <-- pinned defect
+PASS  a numbered street written with and without its ordinal ending is one street line, and the house number is left alone  <-- pinned defect
 ...
 PASS  the hash depends on the key, so it is not a plain SHA-256 that anyone could compute from the public address list  <-- pinned defect
 ...
@@ -48,11 +52,14 @@ PASS  a wrong key is refused, because it would match nothing and read as clean  
 PASS  a roster with a line cut off is refused, not half-applied  <-- pinned defect
 ...
 PASS  a street line followed by a city and a ZIP code with no comma is still found  <-- pinned defect
+PASS  a roster built from lines that go on after the suffix finds a dataset line that stops at the street  <-- pinned defect
 PASS  a different house number or street is not held: the match is on whole words, not on text  <-- pinned defect
 ...
 PASS  rows read and none checked is exit 4, not a clean run  <-- pinned defect
+PASS  more than half the rows unchecked is exit 4, not a clean run  <-- pinned defect
 ...
 PASS  the roster file holds no address text, only hashes  <-- pinned defect
+PASS  a plain list where most rows have no street line exits 4 and writes no roster  <-- pinned defect
 PASS  the dataset screens at exit 1 with the lines of the 4 rows the roster holds, counted past a blank line and a quoted line break  <-- pinned defect
 ...
 PASS  a prefix of a long flag, such as --ap for --apply, is refused with exit 64 and not read as the flag  <-- pinned defect
@@ -62,10 +69,11 @@ PASS  no exempt address appears in anything printed, in any run  <-- pinned defe
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-126 assertions, 0 failed
+174 assertions, 0 failed
 ```
 
-The full run prints all 126 assertions. Each `...` line above is where this block is cut.
+The full run prints all 174 assertions. This block is a cut of a real run, and each `...` line
+above is where it is cut. Every `PASS` line shown is a line of that run.
 
 ## What already exists
 
@@ -95,10 +103,11 @@ only that the search found nothing.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. The dataset and the plain list are CSVs, which every layer and table can be exported as.
 
-The self-test prints the same 126 assertions on Windows (Python 3.13.2), on Python 3.9.25 and on
-Ubuntu (Python 3.12.3). All three outputs are identical line for line.
-`coverage run --branch exemptguard.py --self-test` reports 100 percent of 758 statements and
-172 branches, so no line is left unreached offline.
+The self-test prints the same 174 assertions on Windows (Python 3.13.2) and on Ubuntu (Python
+3.12.3 and Python 3.9.25). The two Ubuntu outputs are byte for byte identical. The Windows output
+differs from them only in its CR LF line ends. Python 3.9 on Windows was not run.
+`coverage run --branch exemptguard.py --self-test` reports 100 percent of 943 statements and
+202 branches, so no line is left unreached offline.
 
 ```
 git clone https://github.com/uhsear/exemptguard.git
@@ -140,9 +149,11 @@ with exit 64 instead of being read as `--apply`. `--appl`, `--app`, `--rost`, `-
 `--rep`, `--sel`, `--make`, `--build`, `--sam` and `--ou` are refused the same way, and a refused
 run writes nothing.
 
-`--out` and `--report` must name new files. A path that is also the dataset, the roster or the key
-is refused with exit 64, on a dry run too. Without that check `--apply` would replace the input
-with its own clean copy.
+A path for `--out` or `--report` that is also the dataset, the roster or the key is refused with
+exit 64, on a dry run too. Without that check `--apply` would replace the input with its own
+clean copy. Any other file that already exists at `--out`, `--report` or `--roster` is replaced
+under `--apply`, so a nightly run can reuse its file names. The run prints `replaced` instead of
+`wrote` when it does this. Never name a file you want to keep.
 
 ## What it checks
 
@@ -176,13 +187,14 @@ wrote roster.txt
 VERDICT: roster of 4 entries. The plain list is not needed to screen a dataset.
 $ head -6 roster.txt
 exemptguard-roster 1
-normalizer 1
-check e349fce5cd3755e44b3a297427e8ac9a3cc899d955d32dc5089cba9be6445110
+normalizer 2
+check c8d07e776e31c73d1693906271144c5e3e046b69408a3a1ccde30597e9a3dcf2
 count 4
-41d90db4d000431bf315d7016dec73c0e02b524e5dcf660483f4f3d5020979a4
-56b03dc2a031d13cee602bf34f3bc3bb8723b2b609cec72ceb65a55d09e90452
+75e04852df41554497454a765c4dd73ea5a64ed459437e6c6dd75d68a73af98f
+892817e35bf16ee7a41d72610a23f1162c62658320a35c7cfa8c5f99b0bf7e26
 ```
 
+The hashes above come from one random key, so a run with another key prints other hashes.
 Without `--apply`, the same build prints `Check only.`, says the roster was not written, and
 writes nothing. The `check` line is a keyed hash of a constant. It lets the tool
 tell a wrong key from a right one. The `count` line lets it tell a truncated roster from a whole
@@ -196,7 +208,7 @@ exemptguard: points.csv 7 row(s), roster roster.txt
 rows checked: 6 of 7, against 4 roster entries
 rows held back: 3
   dataset lines: 2, 4, 7
-rows with no address of two or more words in any named field: 1
+rows with no street line (a house number, then a word) in any named field: 1
   dataset lines: 8
 
 VERDICT: 3 row(s) carry an address on the exempt roster. Do not publish this dataset as it stands. Publish the --out file.
@@ -207,14 +219,16 @@ $ echo $?
 Three rows are on the roster. `P01` spells the suffix `Ln` where the roster says `Lane`. `P03` adds
 a unit, a city and a ZIP code. `P06` adds a unit. `P04` is `4120 Larkspur Ln`: the house number
 differs, so it stays. `P05` is `100 Key West Ave`: `Key` is a unit word in the Postal Service
-table and also a street name, and the tool keeps it as a street name. `P07` has no address, so it
-is counted apart and not called clean. The tool prints only counts and the dataset line numbers.
+table and also a street name, and the tool keeps it as a street name. `P07` has no street line (a
+house number, then a word), so it is counted apart and not called clean. The tool prints only counts and the dataset line numbers.
 
 Add `--out` and `--report` with `--apply` to write the copy to publish:
 
 ```
 $ python exemptguard.py points.csv --roster roster.txt --key-file secret.bin --address-field SITE_ADDR --out clean.csv --report held.csv --apply
 ...
+VERDICT: 3 row(s) carry an address on the exempt roster. Do not publish this dataset as it stands. Publish the --out file.
+
 wrote clean.csv
 
 wrote held.csv
@@ -232,14 +246,17 @@ P07,,Fairview
 $ python exemptguard.py clean.csv --roster roster.txt --key-file secret.bin --address-field SITE_ADDR
 ...
 VERDICT: CLEAN. 3 of 4 row(s) were checked and none matched the roster.
+1 row(s) had no street line to check. This verdict does not cover them.
 $ echo $?
 0
 ```
 
 The run still exits 1 after it writes `clean.csv`, because the input held exempt rows. Publish
 `clean.csv`, and run the tool on it once more. Exit 0 on the copy is the proof. The copy keeps
-the header, every other row exactly as it came, and a quoted line break inside a cell. The report
-names a dataset line and a field. It never holds an address.
+the header, every other row's cell values, and a quoted line break inside a cell. It is written
+again by a CSV writer, so it is not byte for byte the input: a UTF-8 byte order mark is dropped,
+CR LF line ends become LF, quotes that are not needed are removed, and blank lines are dropped.
+The report names a dataset line and a field. It never holds an address.
 
 ### How an address is folded
 
@@ -251,10 +268,13 @@ Both sides go through one function. It does these steps in order.
 4. Fold each word through a fixed table. A street suffix goes to its Postal Service standard
    abbreviation (`ROAD` to `RD`, `BOULEVARD` to `BLVD`), using every variant that Appendix C1 of
    Publication 28 lists. A direction goes to its letters (`NORTHEAST` to `NE`). A unit word goes to
-   its approved abbreviation (`SUITE` to `STE`). `FIFTH` goes to `5TH` and `SAINT` goes to `ST`.
-   The ordinal and `SAINT` rows are this tool's own and are not from Publication 28.
-5. Remove leading zeros from the house number.
-6. Cut off the unit and everything after it.
+   its approved abbreviation (`SUITE` to `STE`). `FIRST` to `TENTH` go to `1` to `10`, and
+   `SAINT` goes to `ST`. The ordinal and `SAINT` rows are this tool's own and are not from
+   Publication 28.
+5. Drop the ordinal ending from every word after the first (`5TH` to `5`, `22ND` to `22`), so
+   `NW 5th St` and `NW 5 St` are one street. The house number is left alone.
+6. Remove leading zeros from the house number.
+7. Cut off the unit and everything after it.
 
 A unit is a pound sign, or one of the approved designators in Appendix C2 (`APT`, `STE`, `UNIT`,
 `LOT` and the rest). A designator is a unit only from the third word on, and only when a number,
@@ -268,6 +288,12 @@ $ python -c "from exemptguard import normalize as n; print(' '.join(n('100 Key W
 $ python -c "from exemptguard import normalize as n; print(' '.join(n('88 North Quillfeather St Unit B, Fairview FL 33000')))"
 88 N QUILLFEATHER ST
 ```
+
+The roster side is cut after its first street suffix, with any directions and further suffixes
+that follow it (`12 OAK ST NE`, `5 OAK PARK LN`). A city or ZIP code written after the suffix with
+no comma (`412 Larkspur Ln Fairview FL 34400`) is dropped, and the build counts such lines. A cut
+in the wrong place, for a street name that holds a suffix word and goes on, leaves a shorter
+entry. That holds more rows, not fewer.
 
 The dataset side is then tried one prefix at a time, from two words up to ten. This finds
 `412 LARKSPUR LN` at the front of `412 LARKSPUR LN FAIRVIEW 33000` when a city and ZIP code follow
@@ -295,28 +321,34 @@ The same exit 3 covers a roster with a line cut off or added, a header that is d
 is not a hash, an empty roster, a roster built by another version of the folding table, and a key
 file under 16 bytes. A copy of the roster that went through Windows line endings still reads.
 
-**A dataset where nothing could be checked.** Rows were read, and no row had an address of two or
-more words in a named column. That is a wrong column, or an empty one. Exit 4, and no copy is
-written, because a copy would look like a clean one. Here `blank.csv` has the header
-`PARCEL,SITE_ADDR` and two rows, one with an empty address and one with the word `Vacant`.
+**A dataset where too little could be checked.** A row is checked only when a named column holds
+a street line: a house number, then a word. `Main St` and `PO Box 5` have no house number, so
+they are not checked. When no row is checked, or when more than half the rows are not checked
+(`MAX_UNCHECKED_PERCENT`, 50), the run exits 4 and writes no copy, because a copy would look like
+a clean one. That is a wrong column, or an empty one. Exactly half is allowed: 50 unchecked rows in
+100 pass, and 51 do not. If any row matched, the run exits 1 whatever the share, and the 50 percent
+rule is not applied. Here `blank.csv` has the header `PARCEL,SITE_ADDR` and two rows, one with an
+empty address and one with the word `Vacant`.
 
 ```
 $ python exemptguard.py blank.csv --roster roster.txt --key-file secret.bin --address-field SITE_ADDR --out copy.csv --apply
 exemptguard: blank.csv 2 row(s), roster roster.txt
 rows checked: 0 of 2, against 4 roster entries
 rows held back: 0
-rows with no address of two or more words in any named field: 2
+rows with no street line (a house number, then a word) in any named field: 2
   dataset lines: 2, 3
 
-VERDICT: NOTHING CHECKED. No row had an address of two or more words in a named field, so no row was compared with the roster. This is not a clean dataset. Look for a wrong column, or an address column that is empty.
+VERDICT: NOTHING CHECKED. No row had a street line in a named field, so no row was compared with the roster. This is not a clean dataset. Look for a wrong column, or an address column that is empty.
 
-Nothing written, because nothing was checked and a copy would look like a clean one.
+Nothing written, because too little was checked and a copy would look like a clean one.
 $ echo $?
 4
 ```
 
 A build that finds no usable address in the plain list also exits 4 and leaves the existing roster
-alone.
+alone. So does a build where more than half the plain rows have no street line
+(`VERDICT: TOO LITTLE BUILT`), because a roster made from a few rows would let the rest of the
+list through. The same 50 percent rule applies.
 
 **A column that is wrong.** `--address-field ADDR` against a file without that column exits 64 and
 lists the columns the file has. A column name that appears twice in the header is refused too,
@@ -324,7 +356,7 @@ because one of the two would be read without a word.
 
 ```
 $ python exemptguard.py points.csv --roster roster.txt --key-file secret.bin --address-field ADDR
-error: column 'ADDR' is not in the CSV. It has: PARCEL, SITE_ADDR, CITY
+error: column 'ADDR' is not in the CSV. It has 3 column(s): PARCEL, SITE_ADDR, CITY
 $ echo $?
 64
 ```
@@ -347,33 +379,36 @@ $ echo $?
 
 | Code | Meaning |
 |---|---|
-| 0 | At least one row was checked and none matched the roster. |
+| 0 | No row matched, and at most half the rows had no street line to check. A dataset with a header and no rows has nothing to check and also exits 0. |
 | 1 | At least one row matched. Publish the `--out` file, not the input. |
 | 2 | A file could not be read or written, a file is not UTF-8, or `--make-key` would replace a file. |
 | 3 | Refused. The roster is damaged, the key does not open it, or the key is too short. |
-| 4 | Nothing was checked, or nothing was built. No row had an address to compare. |
+| 4 | Too little was checked, or too little was built: more than half the rows had no street line to compare. |
 | 64 | Usage error, including a column that is not in the CSV, an unknown or abbreviated flag, and an output path that is an input. |
 | 70 | An unexpected crash. This is a fault in the tool and not a finding. The traceback is on stderr. |
 
 Exit 1 is not exit 3. A scheduled job that files "a row matched" must not file "the key is wrong"
 the same way. Exit 4 is not exit 0 for the same reason: "I checked and found nothing" and "I could
-not check" are different facts.
+not check" are different facts. The `--self-test` footer also exits 1 when an assertion fails,
+which is the code for "a row matched", so read a self-test exit apart from a screening exit.
 
 ## Limits
 
 - It decides nothing about who is exempt. The records custodian does that, and the roster is only
   as good as the list it was built from. The statute is cited for context: Florida Statutes
   s. 119.071(4)(d)2. lists groups whose home addresses are exempt from public inspection, for
-  example active or former sworn law enforcement personnel (2.a.) and current or former judges
-  (2.e.). Whether the exemption reaches a particular published dataset is a question for counsel.
+  example active or former sworn law enforcement personnel (2.a.) and current or former justices
+  and judges (2.e.). Whether the exemption reaches a particular published dataset is a question for counsel.
 - It matches the street line only. A city, a state and a ZIP code are ignored, so `412 Larkspur
   Ln` in another town is held too. That is the safe error.
 - It does not match fuzzily. A misspelled street (`Larkspar`) in either file is missed. Fix the
   spelling, or build the roster from the spelling the dataset uses. A table of street suffixes
   cannot repair a typing mistake.
-- The match runs one way. The dataset side is tried by prefix, and the roster side is whole. A
-  roster line `12 Oak St NE` does not find a dataset line `12 Oak St`, but a roster line
-  `12 Oak St` does find `12 Oak St NE`. Put the shortest form of each address in the roster.
+- The match runs one way. The dataset side is tried by prefix, and the roster side is cut at
+  its street suffix. A roster line `12 Oak St NE` does not find a dataset line `12 Oak St`, but a
+  roster line `12 Oak St` does find `12 Oak St NE`. Put the shortest form of each address in the
+  roster. A roster entry of more than ten folded words can never match, because a dataset
+  address is tried up to ten words.
 - A roster entry of two words, such as `12 Broadway`, matches every dataset address that starts
   with the same two words. The build report counts them. A roster line that is missing its street
   suffix, `12 Oak`, does the same.
@@ -381,6 +416,50 @@ not check" are different facts.
   the Appendix passes through unchanged. A designator written with no space before its number
   (`APT4`) is split. A designator that is followed by a word that is not a range, such as `REAR`
   before `APT 2`, cuts only at the later one.
+- A header-only dataset has nothing to check and exits 0. Up to half of the rows can have no
+  street line and the run still exits 0 with `CLEAN`. The verdict says it does not cover those
+  rows, but a scheduled job that reads only the exit code does not see them.
+- When some rows match and more than half the rows had no street line, the run exits 1 and the
+  verdict says to publish the `--out` file. The too-little check (exit 4) is skipped when a row
+  matched, so the verdict does not flag the unchecked rows. Screening the copy exits 4 and shows
+  them.
+- Route aliases and spelling variants are not folded. `STATE ROAD 40` and `SR 40`, `COUNTY ROAD`
+  and `CR`, `U.S. Highway 441` and `US 441`, and `DR` and `DOCTOR` do not match each other.
+  `Mc Intosh` does not match `McIntosh`. `MEADOW` and `MEADOWS` are two Publication 28
+  suffixes (`MDW` and `MDWS`) and do not match each other. Spelled-out ordinals above `TENTH`
+  are not folded to their numbers. Put every spelling the dataset uses into the roster.
+- A house number with a letter or a fraction (`412A Larkspur Ln`, `412-A Larkspur Ln`,
+  `412 1/2 Larkspur Ln`) does not match a roster line `412 Larkspur Ln`. A thousands separator
+  (`1,412 Larkspur Ln`) cuts the line at the comma, so the row is counted as having no street
+  line. Build the roster from the spelling the dataset uses.
+- A character that Unicode does not split into ASCII (a zero-width space, an en dash in
+  `410-414`, an Arabic-Indic digit, an o with a slash) is deleted, not read as a word break. So
+  `412<ZWSP>Larkspur Ln` and `410<en dash>414 Larkspur Ln` each become one word and do not match.
+- `N. E.` with a space between the letters is read as two directions, `N` and `E`, and does not
+  match `NE`.
+- A street name that holds a unit word followed by a number or one letter (`Side 2nd`,
+  `Pier A`) is cut at that word on both sides. The roster entry is then shorter than the street
+  and may match other streets with the same house number. That is the safe direction.
+- The column-name error prints the column names of the file it was given, when each name starts
+  with a letter. A plain list saved without a header row can therefore print a person's name
+  (`Jane Roe`) or a street name with no number (`Larkspur Lane`) on stderr and into a job log.
+  A name that starts with a digit is hidden. A key file passed in the dataset position is
+  printed the same way when it is 40 characters or fewer and looks like a name. Keys from
+  `--make-key` are 64 characters and are hidden. Run `--build-roster` on a file with a header
+  row.
+- The roster is not signed. The `check` line proves the key and the `count` line proves the
+  length. A roster with entries swapped or removed and the count line edited to match is
+  accepted.
+- A key file that gained a byte order mark or trailing spaces from an editor holds a different
+  key and is refused with exit 3, as a key that does not open the roster. Keep the key file byte
+  for byte as `--make-key` wrote it.
+- The key is read only from a file. There is no environment variable or standard input route,
+  so the key is protected by file permissions alone.
+- A write to `--out` and then `--report` is not atomic. On Windows, a path written as an 8.3
+  short name or an alternate data stream can pass the same-file check, but only for a file that
+  does not exist yet.
+- A Ctrl-C or a closed output pipe is not mapped to this tool's exit codes in every case.
+  `KeyboardInterrupt` is not caught, so the exit code then comes from the interpreter.
 - Only the named columns are read. A home can sit in a second address column, a free-text note,
   or the geometry. A point layer's coordinates are the address, so the held row is removed whole
   and the coordinates go with it. A rooftop point whose address cell is blank is counted as
@@ -402,7 +481,7 @@ not check" are different facts.
   then `--report` can fail.
 - It reads the whole CSV into memory. One run over 200,000 synthetic rows against a roster of
   about 3,000 entries took 2.98 seconds on a Windows workstation and 1.77 seconds on an Ubuntu
-  server. Those figures come from one workstation and one server.
+  server. Those figures were measured once and are not reproducible from this repository.
 - US street addresses only. A rural route, a post office box and an address in another country
   are folded as plain words and are not understood.
 - UTF-8 CSV only, with a header row. A row with extra cells is kept as it is, and a short row has
@@ -412,7 +491,8 @@ not check" are different facts.
 - The tool opens no socket and imports no network module. The self-test proves this by reading
   its own imports. There is no network path to run against a stub server.
 - It prints no address, hash or key. The self-test greps every printed line, the roster, the
-  report and the clean copy for the synthetic addresses, the hashes and the keys.
+  report and the clean copy for the synthetic addresses, the hashes and the keys. The one text
+  from a roster that a refusal can print is a version number made of digits.
 
 ## Sources
 

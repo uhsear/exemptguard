@@ -16,3 +16,7 @@ coverage.xml
 htmlcov/
 *.bin
 roster*.txt
+*.key
+key*.txt
+*secret*
+*roster*

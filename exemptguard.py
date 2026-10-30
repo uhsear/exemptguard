@@ -29,11 +29,12 @@ the roster safe to hold, and the key is kept apart from it.
 Nothing is written without --apply. The tool never prints an address, a hash
 or the key. It prints counts and the dataset line numbers of the rows it holds.
 
-Exit codes: 0 no row matched, and at most half the rows had no street line to
-check (a dataset with no rows at all also exits 0), 1 at least one row matched
-(publish the --out file, not the input), 2 a file could not be read or written,
-3 refused (the roster is damaged or the key does not open it), 4 too little was
-checked (more than half the rows had no street line) or too little was built, 64
+Exit codes: 0 no row matched, and no more rows than --max-unchecked allows had
+no street line to check (the default allows none; a dataset with no rows at all
+also exits 0), 1 at least one row matched (publish the --out file, not the
+input), 2 a file could not be read or written or is empty, 3 refused (the
+roster is damaged or the key does not open it), 4 too little was checked or too
+little was built (more rows than --max-unchecked allows had no street line), 64
 usage error, 70 an unexpected crash, which is never a finding.
 """
 
@@ -63,7 +64,7 @@ import unicodedata
 # Bump this when any table below changes. A roster records the version it was
 # built with, and a different version is refused, because the same address
 # would hash to a different value and the roster would silently match less.
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 # The shortest key file accepted, in bytes. A short key can be guessed, and a
 # guessed key turns the roster back into a list.
@@ -74,13 +75,22 @@ MIN_KEY_BYTES = 16
 # prefix at a time, so the street line is found inside it.
 MAX_PREFIX_WORDS = 10
 
-# A dataset is refused (exit 4) when more than this share of its rows has no
-# street line in any named field. A wrong or mostly empty column lands here.
-MAX_UNCHECKED_PERCENT = 50
+# The default for --max-unchecked: the share of rows that may have no street
+# line in any named field before the run exits 4. It is zero, because a row the
+# tool could not read is a row it did not check, and exit 0 must not hide that.
+MAX_UNCHECKED_PERCENT = 0
 
 # The widest house number range, such as 410-414, that is expanded into one
 # street line per number. A wider range is tried as written only.
 MAX_RANGE = 200
+
+# The longest house number word that is read as a range end. Python 3.11 and
+# later raise ValueError from int() on a run of more than 4300 digits.
+MAX_NUMBER_DIGITS = 18
+
+# A typed column name shorter than this gets no "did you mean" hint, because
+# two edits make almost any short cell look close to it.
+MIN_HINT_CHARS = 5
 
 ROSTER_MAGIC = "exemptguard-roster 1"
 DEFAULT_SAMPLE = 10
@@ -186,14 +196,14 @@ FOLD = _fold_table()
 _SUFFIXES = frozenset(row.split()[0] for row in SUFFIX_ROWS)
 _DIRECTIONS = frozenset("N S E W NE NW SE SW".split())
 
+# U+00B4 would decompose to a space and split the word, so it is deleted like
+# an apostrophe.
+ACUTE = u"\u00b4"
 _NOT_WORD = re.compile(r"[^0-9A-Z#]+")
 # N.W. and S.E. are one word, NW and SE. Other letters are left alone.
 _DOTTED = re.compile(r"\b([NS])\.([EW])\b")
 # A house number a spreadsheet exported as a number: 412.0
 _DECIMAL = re.compile(r"^\s*([0-9]+)\.0+(?=\s|$)")
-# A column name that is safe to print: words that start with a letter.
-_NAME = re.compile(r"^(?=.{1,40}$)[A-Za-z_][A-Za-z0-9_.-]*"
-                   r"( [A-Za-z_][A-Za-z0-9_.-]*)*$")
 # 5TH, 22ND: the ordinal ending is dropped from a numbered street, so NW 5TH ST
 # and NW 5 ST are one street line. The house number (first word) is exempt.
 _ORDINAL = re.compile(r"^([0-9]+)(?:ST|ND|RD|TH)$")
@@ -236,14 +246,15 @@ def normalize(text):
 
     Case, punctuation, accents, no-break spaces and full-width digits are
     flattened. Everything after the first comma is dropped. An apostrophe is
-    deleted (O'BRIEN is OBRIEN), N.W. is NW, and a house number written 412.0
-    is 412. Suffixes, directionals and unit words are folded to one spelling,
+    deleted (O'BRIEN is OBRIEN, and so is O, acute accent, BRIEN), N.W. is NW,
+    and a house number written 412.0 is 412. Suffixes, directionals and unit words are folded to one spelling,
     an ordinal ending is dropped (5TH is 5), a unit is cut off, and leading
     zeros are removed from the house number.
     """
     if not text:
         return ()
-    flat = unicodedata.normalize("NFKD", text).encode("ascii", "ignore")
+    flat = unicodedata.normalize("NFKD", text.replace(ACUTE, ""))
+    flat = flat.encode("ascii", "ignore")
     flat = flat.decode("ascii").upper().split(",")[0].replace("#", " # ")
     flat = _DECIMAL.sub(r"\1", flat.replace("'", ""))
     flat = _DOTTED.sub(r"\1\2", flat)
@@ -265,9 +276,12 @@ def addressable(words):
     """True when words can be a street line: a house number, then a word.
 
     A placeholder such as NO SITUS ADDRESS, a street name with no number and a
-    city with a state are not street lines, so they are not "checked".
+    city with a state are not street lines, so they are not "checked". Neither
+    is a parcel number, a ZIP+4 or a phone number: after the house number, at
+    least one word must hold a letter.
     """
-    return len(words) >= 2 and words[0][:1].isdigit()
+    return (len(words) >= 2 and words[0][:1].isdigit()
+            and any(c.isalpha() for w in words[1:] for c in w))
 
 
 def prefixes(words):
@@ -275,19 +289,28 @@ def prefixes(words):
     return [words[:n] for n in range(2, min(len(words), MAX_PREFIX_WORDS) + 1)]
 
 
-def candidates(words):
-    """The street lines to look up for one dataset address.
+def numbered(words):
+    """The street line, then once per number when it starts with a range.
 
-    That is every prefix of the words. A house number range such as 410-414
-    covers 412, so each number in the range is tried as well (see MAX_RANGE).
+    A house number range such as 410-414 covers 412, so each number in the
+    range is a street line too (see MAX_RANGE). A range is two digit words
+    before the street name, so 10 5TH ST (a numbered street) is read as one as
+    well, which only holds more rows.
     """
-    found = prefixes(words)
-    if len(words) > 2 and words[0].isdigit() and words[1].isdigit():
+    found = [words]
+    if (len(words) > 2 and words[0].isdigit() and words[1].isdigit()
+            and max(len(words[0]), len(words[1])) <= MAX_NUMBER_DIGITS):
         low, high = sorted((int(words[0]), int(words[1])))
         if 0 < high - low <= MAX_RANGE:
             for number in range(low, high + 1):
-                found.extend(prefixes((str(number),) + words[2:]))
+                found.append((str(number),) + words[2:])
     return found
+
+
+def candidates(words):
+    """The street lines to look up for one dataset address: every prefix of
+    the words, and of each number of a house number range."""
+    return [p for line in numbered(words) for p in prefixes(line)]
 
 
 def hasher(key):
@@ -364,21 +387,32 @@ def parse_key(raw):
     return key
 
 
-def _name_list(names):
-    """The column names that are safe to print, and a count of the rest.
+def _distance(a, b):
+    """The edit distance between two strings, ignoring case."""
+    a, b = a.lower(), b.lower()
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        new = [i]
+        for j, y in enumerate(b, 1):
+            new.append(min(row[j] + 1, new[j - 1] + 1, row[j - 1] + (x != y)))
+        row = new
+    return row[-1]
 
-    A CSV with no header row makes its first data row the header, and that row
-    can be an exempt home address. Only a name made of words that start with a
-    letter is shown, so an address that starts with a house number is not.
+
+def _hint(wanted, names):
+    """A name from the file that is one or two edits from the one typed.
+
+    A file's own cells are never printed otherwise. A CSV with no header row
+    makes its first data row the header, and that row can be an exempt person
+    and address. A key file passed as the dataset is one cell of key text. A
+    name two edits from text the user typed reveals nothing the user did not
+    already know.
     """
-    plain = [n for n in names if _NAME.match(n)]
-    hidden = len(names) - len(plain)
-    text = ": " + ", ".join(plain) if plain else ""
-    if hidden:
-        text += (". " if plain else ": ") + (
-            "%d name(s) are not shown because they do not look like column "
-            "names. Does the file have a header row?" % hidden)
-    return text
+    near = [n for n in names if 0 < _distance(wanted, n) <= 2
+            and len(wanted) >= MIN_HINT_CHARS]
+    if not near:
+        return ""
+    return " Did you mean %s?" % " or ".join(repr(n) for n in near[:3])
 
 
 def compile_specs(specs, header):
@@ -400,8 +434,9 @@ def compile_specs(specs, header):
             found = [i for i, n in enumerate(names) if n == name]
             if not found:
                 raise ValueError(
-                    "column %r is not in the CSV. It has %d column(s)%s"
-                    % (name, len(names), _name_list(names)))
+                    "column %r is not in the CSV. It has %d column(s), and "
+                    "their names are not printed.%s Does the file have a "
+                    "header row?" % (name, len(names), _hint(name, names)))
             if len(found) > 1:
                 raise ValueError("column %r is in the CSV %d times, so it is "
                                  "not clear which one holds the address"
@@ -418,19 +453,21 @@ def cell_words(cells, positions):
 
 
 class Report(object):
-    """What a screening run found. rows is the number of data rows read."""
+    """What a screening run found. rows is the number of data rows read, and
+    percent the share of them that may have no street line."""
 
-    def __init__(self, rows, roster_size):
+    def __init__(self, rows, roster_size, percent=MAX_UNCHECKED_PERCENT):
         self.rows = rows
         self.roster_size = roster_size
+        self.percent = percent
         self.checked = 0
         self.unchecked = []   # dataset lines with no street line
         self.hits = []        # (row index, dataset line, spec)
 
 
-def screen(rows, compiled, key, digests):
+def screen(rows, compiled, key, digests, percent=MAX_UNCHECKED_PERCENT):
     """Screen rows, a list of (line, cells), against the roster hashes."""
-    report = Report(len(rows), len(digests))
+    report = Report(len(rows), len(digests), percent)
     base = hasher(key)
     for index, (line, cells) in enumerate(rows):
         usable = False
@@ -452,14 +489,16 @@ def screen(rows, compiled, key, digests):
     return report
 
 
-def too_many(part, whole):
-    """True when part is more than MAX_UNCHECKED_PERCENT of whole."""
-    return part * 100 > MAX_UNCHECKED_PERCENT * whole
+def too_many(part, whole, percent):
+    """True when part is more than percent of whole."""
+    return part * 100 > percent * whole
 
 
 def too_little(report):
-    """True when more than MAX_UNCHECKED_PERCENT of the rows were not checked."""
-    return too_many(len(report.unchecked), report.rows)
+    """True when more rows than the report allows were not checked, or when
+    rows were read and none was checked, whatever the allowance."""
+    return (bool(report.rows) and not report.checked) or too_many(
+        len(report.unchecked), report.rows, report.percent)
 
 
 def gate(report):
@@ -481,14 +520,43 @@ def street_end(words):
     (12 OAK ST NE, 5 PARK AVE). A cut in the wrong place leaves a shorter
     entry, which holds more rows, not fewer.
     """
+    first = first_suffix(words)
+    if first is None:
+        return words
+    end = first + 1
+    while end < len(words) and (words[end] in _SUFFIXES
+                                or words[end] in _DIRECTIONS):
+        end += 1
+    return words[:end]
+
+
+def first_suffix(words):
+    """The index of the first street suffix after the street name, or None.
+
+    The search starts at the third word, so 5 PARK AVE has its suffix at AVE.
+    """
     for i in range(2, len(words)):
         if words[i] in _SUFFIXES:
-            end = i + 1
-            while end < len(words) and (words[end] in _SUFFIXES
-                                        or words[end] in _DIRECTIONS):
-                end += 1
-            return words[:end]
-    return words
+            return i
+    return None
+
+
+def street_forms(words):
+    """Every street line one plain address is hashed as.
+
+    The cut line (see street_end) and each shorter run that ends at a suffix or
+    a direction, and the line before its first suffix. A city after the street
+    with no comma can start with a suffix or a direction word (LAKE CITY,
+    ST AUGUSTINE, NORTH PORT) and is then part of the cut, so the street alone
+    must be in the roster too. A dataset that has no post-direction or no
+    street type still matches. Every form is a prefix of the cut line, and a
+    dataset line is tried by prefix, so each form only holds more rows.
+    """
+    cut = street_end(words)
+    first = first_suffix(cut)
+    if first is None:
+        return [cut]
+    return [cut[:n] for n in range(first, len(cut) + 1)]
 
 
 def carries_more(words):
@@ -503,7 +571,8 @@ def build_digests(rows, compiled, key):
     A row with no street line is listed, not dropped without a word. A
     two-word key matches every dataset address that starts with those two
     words, and a line that went on after its suffix is cut (see street_end),
-    so both are counted.
+    so both are counted. A house number range is hashed as written and once
+    per number (see numbered), and each line in the forms of street_forms.
     """
     base = hasher(key)
     found = set()
@@ -516,8 +585,10 @@ def build_digests(rows, compiled, key):
             words = cell_words(cells, positions)
             if addressable(words):
                 usable = True
+                for numbered_line in numbered(words):
+                    for form in street_forms(numbered_line):
+                        found.add(digest(base, form))
                 cut = street_end(words)
-                found.add(digest(base, cut))
                 if len(words) == 2:
                     short.add(digest(base, words))
                 if len(cut) < len(words):
@@ -559,16 +630,21 @@ def describe(report, sample=DEFAULT_SAMPLE):
                    "address column that is empty.")
     elif code == 4:
         out.append("VERDICT: TOO LITTLE CHECKED. Only %d of %d row(s) had a "
-                   "street line in a named field, so most of the dataset was "
-                   "not compared with the roster. This is not a clean "
-                   "dataset. Look for a wrong column, or an address column "
-                   "that is mostly empty." % (report.checked, report.rows))
+                   "street line in a named field. The other %d row(s) were not "
+                   "compared with the roster, and --max-unchecked allows %d "
+                   "percent. This is not a clean dataset. Look for a wrong "
+                   "column, or an address column that is empty. If those "
+                   "rows are meant to be blank, raise --max-unchecked."
+                   % (report.checked, report.rows, len(report.unchecked),
+                      report.percent))
     else:
         out.append("VERDICT: CLEAN. %d of %d row(s) were checked and none "
                    "matched the roster." % (report.checked, report.rows))
         if report.unchecked:
-            out.append("%d row(s) had no street line to check. This verdict "
-                       "does not cover them." % len(report.unchecked))
+            out.append("%d row(s) had no street line to check, within the %d "
+                       "percent that --max-unchecked allows. This verdict "
+                       "does not cover them."
+                       % (len(report.unchecked), report.percent))
     return out
 
 
@@ -576,7 +652,8 @@ def describe_build(count, entries, unusable, short, sample=DEFAULT_SAMPLE,
                    long_=0):
     """The lines a roster build prints. Counts and line numbers only."""
     out = ["plain rows read: %d" % count,
-           "roster entries: %d (rows that repeat an address count once)"
+           "roster entries: %d (rows that repeat an address count once, and each "
+           "address is stored in several spellings)"
            % entries]
     if unusable:
         out.append("rows with no street line (a house number, then a word): "
@@ -693,11 +770,20 @@ def _load_roster(path, key):
 
 def _load_table(path):
     try:
-        return read_table(path)
+        header, rows = read_table(path)
+    except UnicodeDecodeError as exc:
+        # The message of the exception names a byte of the file. Only the
+        # offset is printed, because the file may be a key or a plain list.
+        return _stop("%s: not UTF-8 text (first bad byte at offset %d). Save "
+                     "the file as CSV UTF-8." % (path, exc.start), 2)
     except (IOError, OSError, csv.Error, UnicodeError) as exc:
-        # A file that is not UTF-8, a cell over csv's 131072 character limit
-        # and a missing file are all unreadable input, not a finding.
+        # A cell over csv's 131072 character limit and a missing file are
+        # unreadable input, not a finding.
         return _stop("%s: %s" % (path, exc), 2)
+    if not header:
+        return _stop("%s: the file is empty. Name a CSV with a header row."
+                     % path, 2)
+    return header, rows
 
 
 def _compile(specs, header):
@@ -731,6 +817,19 @@ def _no_clash(outputs, inputs):
             if _same_file(path, other):
                 _stop("%s and %s name the same file, so the second would "
                       "replace the first." % (flag, other_flag), 64)
+
+
+def _distinct(inputs):
+    """Refuse two inputs that are one file, such as a key named as the dataset.
+
+    The dataset is read as a CSV, and a read error or a column error about it
+    must never show the key or the roster.
+    """
+    for i, (name, path) in enumerate(inputs):
+        for other_name, other in inputs[i + 1:]:
+            if _same_file(path, other):
+                _stop("%s and %s are the same file. Name the right one."
+                      % (name, other_name), 64)
 
 
 def _verb(path):
@@ -771,6 +870,8 @@ def _build(args):
     _no_clash([("--roster", args.roster)],
               [("the plain list", args.build_roster),
                ("--key-file", args.key_file)])
+    _distinct([("the plain list", args.build_roster),
+               ("--key-file", args.key_file)])
     key = _load_key(args.key_file)
     header, rows = _load_table(args.build_roster)
     compiled = _compile(args.address_field, header)
@@ -783,11 +884,14 @@ def _build(args):
         print("\nVERDICT: NOTHING BUILT. No row had a street line, and an "
               "empty roster blocks nothing. Look for a wrong column.")
         return 4
-    if too_many(len(unusable), len(rows)):
+    if too_many(len(unusable), len(rows), args.max_unchecked):
         print("\nVERDICT: TOO LITTLE BUILT. Only %d of %d plain row(s) had a "
-              "street line, so the roster would leave most of the list out. "
-              "Nothing written. Look for a wrong column."
-              % (len(rows) - len(unusable), len(rows)))
+              "street line, so the roster would leave %d of them out, and "
+              "--max-unchecked allows %d percent. Nothing written. Look for "
+              "a wrong column. If those rows cannot be matched, such as a "
+              "PO Box, raise --max-unchecked and keep the plain list for "
+              "them." % (len(rows) - len(unusable), len(rows), len(unusable),
+                         args.max_unchecked))
         return 4
     if args.apply:
         verb = _verb(args.roster)
@@ -799,8 +903,14 @@ def _build(args):
     else:
         print("\nCheck only. %s was not written. Re-run with --apply."
               % args.roster)
-    print("VERDICT: roster of %d entries. The plain list is not needed to "
-          "screen a dataset." % len(found))
+    if unusable:
+        print("VERDICT: roster of %d entries. %d plain row(s) are NOT on it, "
+              "so the roster does not cover them. Keep the plain list for "
+              "them." % (len(found), len(unusable)))
+    else:
+        print("VERDICT: roster of %d entries. Every plain row is on it, so "
+              "the plain list is not needed to screen a dataset."
+              % len(found))
     return 0
 
 
@@ -810,14 +920,15 @@ def _screen(args):
                if path]
     if args.apply and not outputs:
         _stop("--apply needs --out or --report.", 64)
-    _no_clash(outputs, [("the dataset", args.dataset),
-                        ("--roster", args.roster),
-                        ("--key-file", args.key_file)])
+    inputs = [("the dataset", args.dataset), ("--roster", args.roster),
+              ("--key-file", args.key_file)]
+    _no_clash(outputs, inputs)
+    _distinct(inputs)
     key = _load_key(args.key_file)
     digests = _load_roster(args.roster, key)
     header, rows = _load_table(args.dataset)
     compiled = _compile(args.address_field, header)
-    report = screen(rows, compiled, key, digests)
+    report = screen(rows, compiled, key, digests, args.max_unchecked)
     print("exemptguard: %s %d row(s), roster %s"
           % (args.dataset, len(rows), args.roster))
     for line in describe(report, args.sample):
@@ -871,6 +982,12 @@ def _parse(argv):
     ap.add_argument("--out", help="path for the dataset without the held rows")
     ap.add_argument("--report",
                     help="path for the list of held dataset lines")
+    ap.add_argument("--max-unchecked", dest="max_unchecked", type=int,
+                    default=MAX_UNCHECKED_PERCENT, metavar="PERCENT",
+                    help="the share of rows (0 to 100) that may have no "
+                         "street line before the run exits 4 (default %d). "
+                         "The same limit applies to --build-roster."
+                         % MAX_UNCHECKED_PERCENT)
     ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
                     help="how many line numbers to list under each heading "
                          "(default %d)" % DEFAULT_SAMPLE)
@@ -926,6 +1043,8 @@ def _run(argv):
                   "them.", 64)
         if args.sample < 0:
             _stop("--sample cannot be negative.", 64)
+        if not 0 <= args.max_unchecked <= 100:
+            _stop("--max-unchecked is a percent, from 0 to 100.", 64)
         if args.make_key:
             return _make_key(args)
         for flag, value in (("--roster", args.roster),
@@ -958,8 +1077,10 @@ def _self_test(tmp):
     the ones written under tmp."""
     passed = [0]
     failed = []
+    labels = []
 
     def check(cond, label):
+        labels.append(label)
         if cond:
             passed[0] += 1
             print("PASS  %s" % label)
@@ -1052,7 +1173,7 @@ def _self_test(tmp):
           and N("1500 Heron Pier Road") == ("1500", "HERON", "PIER", "RD")
           and N("12 N Side St") == ("12", "N", "SIDE", "ST")
           and N("7 Stop Rd") == ("7", "STOP", "RD"),
-          "KEY, PIER, SIDE and STOP in a street name are not read as a "
+          "the words KEY, PIER, SIDE and STOP in a street name are not read as a "
           "unit  <-- pinned defect")
     check(N("0012 Oak St") == base_line and N("000 Oak St")[0] == "0",
           "leading zeros leave the house number, and zero stays zero")
@@ -1087,6 +1208,37 @@ def _self_test(tmp):
           "blank text is no words, and one word stays one word")
     check(all(FOLD.get(v, v) == v for v in FOLD.values()) and len(FOLD) > 300,
           "folding is stable: folding a folded word changes nothing")
+    table = "|".join(SUFFIX_ROWS + EXTRA_ROWS
+                     + (" ".join(sorted(DESIGNATORS)),))
+    check(hashlib.sha256(table.encode("ascii")).hexdigest() == (
+        "f6e1f2305441184a66642e99b7be5b319a86454263387428db2ea0174248ae66")
+          and len(SUFFIX_ROWS) == 206 and len(EXTRA_ROWS) == 34,
+          "the suffix, extra-row and designator tables are the ones that "
+          "were checked against Publication 28. If this fails after an edit, "
+          "recheck the table, then bump NORMALIZER_VERSION and the pinned hash  "
+          "<-- pinned defect")
+    last = {}
+    for row in SUFFIX_ROWS + EXTRA_ROWS:
+        for variant in row.split()[1:]:
+            last[variant] = row.split()[0]
+    check(all(FOLD[v] == last[v] for v in last)
+          and all(N("12 Oak %s" % v) == ("12", "OAK", last[v])
+                  for v in last if last[v] not in DESIGNATORS)
+          and all(N("12 Oak St %s 4" % d) == ("12", "OAK", "ST")
+                  and N("12 Oak St %s" % d) == ("12", "OAK", "ST")
+                  for d in DESIGNATORS),
+          "every variant in the tables folds to its standard abbreviation "
+          "and every designator cuts the unit off  <-- pinned defect")
+    check(N("12 Oak St Apt4 Lane") == ("12", "OAK", "ST")
+          and N("12 Oak St Apt4B Lane") == ("12", "OAK", "ST")
+          and N("12 Oak St Boxwood4") == ("12", "OAK", "ST", "BOXWOOD4"),
+          "a unit joined to its number, APT4, is split and cut, and another "
+          "word with a digit is not  <-- pinned defect")
+    check(N("12 O\u00b4Brien Ln") == N("12 O'Brien Ln") == N("12 OBrien Ln")
+          == ("12", "OBRIEN", "LN") and N("12 O\u2019Brien Ln") == N(
+              "12 OBrien Ln"),
+          "an acute accent in a name is deleted like an apostrophe, and does "
+          "not split the word  <-- pinned defect")
     check(prefixes(("A", "B", "C")) == [("A", "B"), ("A", "B", "C")]
           and prefixes(("A",)) == []
           and len(prefixes(tuple("W%d" % i for i in range(15)))[-1])
@@ -1118,6 +1270,29 @@ def _self_test(tmp):
               ("211", "412", "LARKSPUR", "LN")),
           "a house number range is tried one number at a time, up to "
           "MAX_RANGE wide  <-- pinned defect")
+    check(("412", "LARKSPUR", "LN") in candidates(("412", "413", "LARKSPUR", "LN"))
+          and ("413", "LARKSPUR", "LN") in candidates(
+              ("412", "413", "LARKSPUR", "LN"))
+          and ("412", "LARKSPUR") in candidates(("410", "414", "LARKSPUR")),
+          "the smallest range, two neighbours, and a range before a one-word "
+          "street are both tried  <-- pinned defect")
+    giant = "9" * 5000
+    edge = "1" * MAX_NUMBER_DIGITS
+    edge2 = "1" * (MAX_NUMBER_DIGITS - 1) + "2"
+    check(len(numbered((edge, edge2, "OAK"))) == 3
+          and len(numbered((edge, "1" * (MAX_NUMBER_DIGITS + 1), "OAK"))) == 1
+          and numbered(("5", giant, "OAK")) == [("5", giant, "OAK")]
+          and numbered((giant, "5", "OAK")) == [(giant, "5", "OAK")]
+          and numbered(("4A", "5", "OAK")) == [("4A", "5", "OAK")]
+          and not addressable(("4A", "5")),
+          "the longest house number that can end a range is "
+          "MAX_NUMBER_DIGITS wide, and a number with a letter is not a "
+          "range  <-- pinned defect")
+    check(candidates((giant, giant, "OAK")) == prefixes((giant, giant, "OAK"))
+          and numbered(("1", "2")) == [("1", "2")]
+          and numbered((giant, "2", "OAK")) == [(giant, "2", "OAK")],
+          "a house number of thousands of digits is not read as a range end "
+          "and raises nothing on any Python  <-- pinned defect")
 
     # ---- the hash, the key and the roster file
     key = b"synthetic-test-key-0123456789"
@@ -1189,6 +1364,22 @@ def _self_test(tmp):
            "a damaged header line is refused")
     raises(lambda: parse_roster(text.replace("count 2", "count two"), key),
            "a count that is not a number is refused")
+
+    def reason(fn):
+        try:
+            fn()
+        except ValueError as exc:
+            return str(exc)
+
+    check("the roster is empty" in reason(
+        lambda: parse_roster(roster_text(key, set()), key))
+          and "(9, this tool is %d)" % NORMALIZER_VERSION in reason(
+              lambda: parse_roster(text.replace(
+                  "normalizer %d" % NORMALIZER_VERSION, "normalizer 9"), key))
+          and "says 5 entries and holds 2" in reason(
+              lambda: parse_roster(text.replace("count 2", "count 5"), key)),
+          "a refused roster says why: empty, another normalizer version, or "
+          "a count that does not match")
     check(parse_key(b"abcdefghijklmnop\r\n") == b"abcdefghijklmnop"
           and len(parse_key(b"x" * 16)) == 16,
           "a key keeps every byte but the line ending, and 16 bytes pass")
@@ -1214,6 +1405,10 @@ def _self_test(tmp):
     check(plain_found == ["412 Larkspur Ln"] and keyed_found == [],
           "a plain SHA-256 roster gives up its address to a search over a "
           "public address list, and the keyed roster does not")
+    check([a for a in pool if digest(base, N(a)) in keyed_roster]
+          == ["412 Larkspur Ln"],
+          "a thief who holds the key as well as the keyed roster recovers the "
+          "address with the same search, so the key is kept apart")
     demo_plain = ["412 Larkspur Lane", "88 N. Quillfeather Street, Apt 3",
                   "1500 Heron Pier Road", "21 Tamarack Court"]
     demo_data = ["412 Larkspur Ln", "90 Birchwood Ct",
@@ -1242,18 +1437,33 @@ def _self_test(tmp):
           == [("ADDNUM", [1]), ("STNAME", [2])],
           "a spec names one column or several joined by commas")
     raises(lambda: compile_specs(["NOPE"], header),
-           "a column that is not there is refused with the list of columns")
-    check(_name_list(["ID", "Site Address", "ADDR_1", "a.b-c"])
-          == ": ID, Site Address, ADDR_1, a.b-c"
-          and _name_list([]) == ""
-          and _name_list(["412 Larkspur Lane", "Fairview"])
-          == ": Fairview. 1 name(s) are not shown because they do not look "
-          "like column names. Does the file have a header row?"
-          and _name_list(["", "1ST", "x" * 41, "Oak,"]).startswith(
-              ": 4 name(s) are not shown")
-          and _name_list(["x" * 40]) == ": " + "x" * 40,
-          "only names that look like column names are listed: an address "
-          "from a file with no header row is not  <-- pinned defect")
+           "a column that is not there is refused, and the file's columns are not listed")
+    check(_hint("SITE_ADDR", ["ID", "SITE_ADR", "Jane Roe"])
+          == " Did you mean 'SITE_ADR'?"
+          and _hint("SITE_ADDR", ["ID", "Jane Roe", "412 Larkspur Lane"]) == ""
+          and _hint("SITE_ADDR", ["site_addr"]) == ""
+          and _hint("ID", ["IDS"]) == "" and _hint("SITE_ADDR", []) == ""
+          and _hint("HOME_ADDR", ["HOME_ADDX", "HOME_ADD", "HOME_ADDRE",
+                                  "HOME_ADR"]).count(" or ") == 2
+          and _distance("kitten", "SITTING") == 3 and _distance("", "ab") == 2
+          and _distance("abc", "abd") == 1 and _distance("abc", "abcd") == 1
+          and _distance("abc", "") == 3 and _distance("ab", "ba") == 2
+          and _distance("same", "SAME") == 0
+          and _hint("SITE_ADDR", ["SITE_AD"]) == " Did you mean 'SITE_AD'?"
+          and _hint("SITE_ADDR", ["SITE_A"]) == ""
+          and _hint("ADDR1", ["ADDR2"]) == " Did you mean 'ADDR2'?"
+          and _hint("ADDR", ["ADDX"]) == "",
+          "a file's cells are never printed as column names, only a name "
+          "within two edits of the typed one  <-- pinned defect")
+    raises(lambda: compile_specs(["SITE_ADDR"], ["Xk9fT2mQpL7vZ4rWc8Hd"]),
+           "a column error about a one-cell file raises")
+    try:
+        compile_specs(["SITE_ADDR"], ["Xk9fT2mQpL7vZ4rWc8Hd", "Jane Roe"])
+    except ValueError as exc:
+        text = str(exc)
+    check("Xk9f" not in text and "Jane" not in text and "2 column(s)" in text,
+          "the column error prints neither a key nor a person from the "
+          "file  <-- pinned defect")
     raises(lambda: compile_specs(["SITE"], header),
            "a column name that appears twice is refused  <-- pinned defect")
     raises(lambda: compile_specs(["ID,"], header),
@@ -1271,14 +1481,14 @@ def _self_test(tmp):
              (7, ["12 Broadway"])]
     found, unusable, short, long_ = build_digests(
         plain, compile_specs(["HOME"], ["HOME"]), key)
-    check(len(found) == 3 and unusable == [4, 5] and short == 1
+    check(len(found) == 5 and unusable == [4, 5] and short == 1
           and long_ == 0,
           "a repeated address counts once, an empty row and a one-word row "
           "are listed, and a two-word key is counted")
     two, none_, _, _ = build_digests([(2, ["1 A St", "9 B St"])],
                                      compile_specs(["X", "Y"], ["X", "Y"]),
                                      key)
-    check(len(two) == 2 and none_ == [],
+    check(len(two) == 4 and none_ == [],
           "a row with a second address column gives a key per column")
     _, no_number, _, _ = build_digests(
         [(2, ["Larkspur Lane"]), (3, ["No Situs Address"])],
@@ -1319,7 +1529,7 @@ def _self_test(tmp):
         [(2, ["412 Larkspur Lane Fairview FL 34400"]),
          (3, ["88 N Quill St Fairview FL 34400"])],
         compile_specs(["HOME"], ["HOME"]), key)
-    check(cut_found == roster and cut_n == 2
+    check(cut_found >= roster and len(cut_found) == 4 and cut_n == 2
           and len(screen([(2, ["412 Larkspur Ln"]), (3, ["88 N Quill St"]),
                           (4, ["90 Birchwood Ct"])], spec1, key,
                          cut_found).hits) == 2,
@@ -1328,7 +1538,8 @@ def _self_test(tmp):
 
     def held(*addresses, **kw):
         rows = [(i + 2, [a]) for i, a in enumerate(addresses)]
-        return screen(rows, kw.get("specs", spec1), key, roster)
+        return screen(rows, kw.get("specs", spec1), key, roster,
+                      kw.get("percent", 50))
 
     rep = held("412 Larkspur Ln", "90 Birchwood Ct", "88 North Quill Street "
                "Unit B, Fairview FL 33000", "")
@@ -1340,6 +1551,10 @@ def _self_test(tmp):
           and len(held("412 Larkspur Ln Fairview 33000").hits) == 1,
           "a street line followed by a city and a ZIP code with no comma is "
           "still found  <-- pinned defect")
+    rep = held("2234-001-000", "34471-1234", "352-555-1234", "5 3")
+    check(gate(rep) == 4 and rep.checked == 0 and len(rep.unchecked) == 4,
+          "a parcel number, a ZIP+4, a phone number and two bare numbers are "
+          "not street lines, so a wrong column is exit 4  <-- pinned defect")
     check(held("4120 Larkspur Ln", "41 Larkspur Ln", "1412 Larkspur Ln",
                "412 Larkspurs Ln").hits == [],
           "a different house number or street is not held: the match is on "
@@ -1347,13 +1562,74 @@ def _self_test(tmp):
     check(len(held("412 Larkspur Ln Ext").hits) == 1,
           "a longer street line that begins with a roster line is held, "
           "because holding too much is the safe error")
-    north_east = frozenset([digest(base, N("12 Oak St NE"))])
-    plain_oak = frozenset([digest(base, N("12 Oak St"))])
-    check(screen([(2, ["12 Oak St"])], spec1, key, north_east).hits == []
+
+    def forms_of(text):
+        return frozenset(digest(base, f) for f in street_forms(N(text)))
+
+    check(len(screen([(2, ["12 Oak St"])], spec1, key,
+                     forms_of("12 Oak Street NE")).hits) == 1
           and len(screen([(2, ["12 Oak St NE"])], spec1, key,
-                         plain_oak).hits) == 1,
-          "known limit: a roster line with a trailing direction does not "
-          "find a dataset line without it, but the reverse is held")
+                         forms_of("12 Oak Street")).hits) == 1
+          and len(screen([(2, ["12 Oak St SW"])], spec1, key,
+                         forms_of("12 Oak Street NE")).hits) == 1,
+          "a roster line with a post-direction finds a dataset line "
+          "without it, and the reverse, and holds the wrong direction too  "
+          "<-- pinned defect")
+    check(len(screen([(2, ["88 N Quillfeather"])], spec1, key,
+                     forms_of("88 N Quillfeather St")).hits) == 1
+          and len(screen([(2, ["412 Larkspur"])], spec1, key,
+                         forms_of("412 Larkspur Lane")).hits) == 1
+          and screen([(2, ["412 Birchwood"])], spec1, key,
+                     forms_of("412 Larkspur Lane")).hits == [],
+          "a dataset with no street type still finds the roster line  "
+          "<-- pinned defect")
+    check(len(screen([(2, ["412 Larkspur Ct"])], spec1, key,
+                     forms_of("412 Larkspur Lane")).hits) == 1
+          and len(screen([(2, ["12 Oak St"])], spec1, key,
+                         forms_of("12 N Oak St")).hits) == 0
+          and len(screen([(2, ["12 N Oak St"])], spec1, key,
+                         forms_of("12 Oak St")).hits) == 0
+          and len(screen([(2, ["9 Elm St; 412 Larkspur Ln"])], spec1, key,
+                         forms_of("412 Larkspur Ln")).hits) == 0
+          and len(screen([(2, ["9 Elm St & 412 Larkspur Ln"])], spec1, key,
+                         forms_of("9 Elm St")).hits) == 1
+          and screen([(2, ["Apt 4, 412 Larkspur Ln"])], spec1, key,
+                     forms_of("412 Larkspur Ln")).unchecked == [2]
+          and numbered(N("412-5 Larkspur Ln")) == [("412", "5", "LARKSPUR", "LN")]
+          and ("5", "ST") in candidates(N("10 5th St"))
+          and ("10", "ST") in candidates(N("10 5th St")),
+          "the stated limits hold: a spelling kept on one side only, the "
+          "street type, a second address in a cell, a unit first, a "
+          "hyphenated unit and a range that is really a numbered street")
+    check(street_forms(N("412 Larkspur Lane Lake City FL"))
+          == [("412", "LARKSPUR"), ("412", "LARKSPUR", "LN"),
+              ("412", "LARKSPUR", "LN", "LK")]
+          and street_forms(N("5 Oak Ave North Port"))
+          == [("5", "OAK"), ("5", "OAK", "AVE"), ("5", "OAK", "AVE", "N"),
+              ("5", "OAK", "AVE", "N", "PRT")]
+          and street_forms(("12", "OAK")) == [("12", "OAK")]
+          and first_suffix(N("5 Park Ave")) == 2
+          and first_suffix(("12", "OAK")) is None,
+          "a city that starts with a suffix or a direction word is cut off "
+          "in the roster by keeping every shorter street line  "
+          "<-- pinned defect")
+    city_forms = frozenset(
+        digest(base, f) for line in numbered(N("412 Larkspur Lane Lake City"))
+        for f in street_forms(line)) | frozenset(
+        digest(base, f) for f in street_forms(N("9 Elm Street St Augustine")))
+    check(len(screen([(2, ["412 Larkspur Ln"]), (3, ["9 Elm St, St Augustine"]),
+                      (4, ["412 Larkspur Ln, Lake City"])],
+                     spec1, key, city_forms).hits) == 3,
+          "a roster city such as Lake City or St Augustine, typed after the "
+          "suffix with no comma, does not hide the street  <-- pinned defect")
+    range_found, _, _, _ = build_digests(
+        [(2, ["412-414 Larkspur Ln"])], spec1, key)
+    check(len(screen([(2, ["412 Larkspur Ln"]), (3, ["413 Larkspur Ln"]),
+                      (4, ["414 Larkspur Ln"]), (5, ["415 Larkspur Ln"]),
+                      (6, ["412 414 Larkspur Ln"])],
+                     spec1, key, range_found).hits) == 4,
+          "a roster home written as a range holds every number in it, and "
+          "the range as the dataset spells it  <-- pinned defect")
     check(held("412 Larkspar Ln", "412 Lark Spur Ln").hits == [],
           "known limit: a misspelled street is not matched, there is no "
           "fuzzy matching")
@@ -1379,15 +1655,17 @@ def _self_test(tmp):
           and "VERDICT: CLEAN. 2 of 4 row(s) were checked" in shown
           and "2 row(s) had no street line to check" in shown
           and "does not cover them" in shown,
-          "half the rows unchecked is still clean, and the verdict says "
-          "which rows it does not cover  <-- pinned defect")
+          "with 50 percent allowed, half the rows unchecked is still clean, "
+          "and the verdict says which rows it does not cover  "
+          "<-- pinned defect")
     rep = held("90 Birchwood Ct", "", "Vacant", "")
     shown = "\n".join(describe(rep))
     check(gate(rep) == 4 and rep.checked == 1
           and "TOO LITTLE CHECKED" in shown
           and "Only 1 of 4 row(s)" in shown and "NOTHING CHECKED" not in shown
           and "CLEAN" not in shown,
-          "more than half the rows unchecked is exit 4, not a clean run  "
+          "with 50 percent allowed, more than half the rows unchecked is exit 4, "
+          "not a clean run  "
           "<-- pinned defect")
     rep = held(*(["90 Birchwood Ct"] * 49 + [""] * 51))
     rep50 = held(*(["90 Birchwood Ct"] * 50 + [""] * 50))
@@ -1452,6 +1730,10 @@ def _self_test(tmp):
           and roster.isdisjoint(out_text.split()),
           "the report text carries no address and no hash")
     b_lines = describe_build(7, 4, [6, 7], 2, 10)
+    check(b_lines[2] == "rows with no street line (a house number, then a "
+          "word): 2" and describe(held("90 Birchwood Ct"))[-2] == "",
+          "the build report counts the plain rows with no street line, and a "
+          "blank line sets the verdict apart")
     check(b_lines[0] == "plain rows read: 7"
           and any("plain lines: 6, 7" in x for x in b_lines)
           and any("only two words: 2." in x for x in b_lines),
@@ -1474,19 +1756,22 @@ def _self_test(tmp):
         "4,21 Tamarack Court\n5,\n6,Vacant\n7,412 LARKSPUR LN\n")
     roster_path = path("roster.txt")
     base_args = ["--roster", roster_path, "--key-file", key_path]
-    build = ["--build-roster", plain_csv, "--address-field", "HOME_ADDR"]
+    build = ["--build-roster", plain_csv, "--address-field", "HOME_ADDR",
+             "--max-unchecked", "30"]
     code, out, err = cli(build + base_args)
     check(code == 0 and not os.path.exists(roster_path)
-          and "Check only. " in out and "roster entries: 4" in out
+          and "Check only. " in out and "roster entries: 8" in out
           and "plain lines: 6, 7" in out,
           "a roster build without --apply writes nothing and reports the "
           "counts")
     code, out, err = cli(build + base_args + ["--apply"])
     roster_file = slurp(roster_path)
     check(code == 0 and "wrote %s" % roster_path in out
-          and len(roster_file.splitlines()) == 8
+          and out.startswith("exemptguard: %s\n" % plain_csv)
+          and len(roster_file.splitlines()) == 12
           and parse_roster(roster_file, key) is not None,
-          "--apply writes a roster of 4 entries that reads back with the key")
+          "--apply writes a roster of 8 hashes for 4 addresses that reads "
+          "back with the key")
     low = roster_file.lower()
     check(not any(w in low for w in ("larkspur", "quill", "heron", "tamarack",
                                      "oak"))
@@ -1563,8 +1848,14 @@ def _self_test(tmp):
           "the report names the dataset line and the field, and nothing "
           "else")
     code, out, err = cli([out_path] + base_args + sa)
+    check(code == 4 and "Only 4 of 6" in out,
+          "screening the clean copy again exits 4 until the two blank rows "
+          "are allowed  <-- pinned defect")
+    code, out, err = cli([out_path] + base_args + sa
+                         + ["--max-unchecked", "34"])
     check(code == 0 and "VERDICT: CLEAN. 4 of 6" in out,
-          "screening the clean copy again exits 0, which proves the copy")
+          "screening the clean copy again exits 0, which proves the copy "
+          "for the 4 rows that had a street line")
     code, out, err = cli(run + sa + ["--report", report_path, "--apply"])
     check(code == 1 and slurp(report_path) == report_csv,
           "--report alone writes only the report")
@@ -1577,6 +1868,28 @@ def _self_test(tmp):
           and "Nothing written" in out and slurp(out_path) == before,
           "a dataset where no row has an address exits 4 and writes no copy "
           "that would look clean  <-- pinned defect")
+    blanks = tmpfile("blanks.csv", "PARCEL,SITE_ADDR\nP1,90 Birchwood Ct\nP2,\n"
+                     "P3,UNIT 2 412 Larkspur Ln\n")
+    code, out, err = cli([blanks] + base_args + sa + two_out + ["--apply"])
+    check(code == 4 and "TOO LITTLE CHECKED" in out and "Only 1 of 3" in out
+          and "allows 0 percent" in out and "Nothing written" in out
+          and slurp(out_path) == before and "CLEAN" not in out,
+          "one row with no street line, here a unit written first, makes a "
+          "run with no match exit 4 and write no copy  <-- pinned defect")
+    code, out, err = cli([blanks] + base_args + sa + ["--max-unchecked", "67"])
+    check(code == 0 and "VERDICT: CLEAN. 1 of 3" in out
+          and "within the 67 percent that --max-unchecked allows" in out,
+          "--max-unchecked allows the blank rows and the verdict still says "
+          "it does not cover them")
+    code, out, err = cli([empty_data] + base_args + sa
+                         + ["--max-unchecked", "100"])
+    check(code == 4 and "NOTHING CHECKED" in out,
+          "no row checked is exit 4 even when 100 percent may be blank  "
+          "<-- pinned defect")
+    for bad in ("101", "-1"):
+        code, out, err = cli(run + sa + ["--max-unchecked", bad])
+        check(code == 64 and "--max-unchecked" in err,
+              "--max-unchecked %s is a usage error" % bad)
     wrong = tmpfile("wrong.bin", "a-different-synthetic-key-xyz\n")
     code, out, err = cli([data_path, "--roster", roster_path, "--key-file",
                           wrong] + sa)
@@ -1608,9 +1921,19 @@ def _self_test(tmp):
     with open(latin, "wb") as handle:
         handle.write(b"PARCEL,SITE_ADDR\nP1,12 Rivi\xe8re Rd\n")
     code, out, err = cli([latin] + base_args + sa)
-    check(code == 2 and "latin.csv" in err and "rows checked" not in out,
+    check(code == 2 and "latin.csv" in err and "rows checked" not in out
+          and "offset 27" in err and "0xe8" not in err,
           "a dataset that is not UTF-8 exits 2 instead of being read "
-          "lossily  <-- pinned defect")
+          "lossily, and the error shows an offset and no byte  "
+          "<-- pinned defect")
+    zero = tmpfile("zero.csv", "")
+    code, out, err = cli([zero] + base_args + sa)
+    code2, out2, err2 = cli(["--build-roster", zero, "--address-field", "A"]
+                            + base_args)
+    check(code == 2 == code2 and "zero.csv: the file is empty" in err
+          and "empty" in err2 and out == "",
+          "a zero-byte file exits 2 and says it is empty, instead of a "
+          "usage error about its columns")
     huge = tmpfile("huge.csv", "PARCEL,SITE_ADDR\nP1,%s\n" % ("x" * 140000))
     code, out, err = cli([huge] + base_args + sa)
     check(code == 2 and "field larger" in err,
@@ -1624,7 +1947,8 @@ def _self_test(tmp):
           "swallowing every later row into one cell  <-- pinned defect")
     mostly = tmpfile("mostly.csv", "ID,SITE_ADDR,FULL\n0,,x\n1,,412 Larkspur Ln\n"
                      "2,,412 Larkspur Ln\n3,90 Birchwood Ct,y\n")
-    code, out, err = cli([mostly] + base_args + sa + two_out + ["--apply"])
+    code, out, err = cli([mostly] + base_args + sa + two_out + ["--apply"]
+                         + ["--max-unchecked", "50"])
     check(code == 4 and "TOO LITTLE CHECKED" in out
           and "Only 1 of 4 row(s)" in out and "Nothing written" in out
           and slurp(out_path) == before,
@@ -1642,10 +1966,37 @@ def _self_test(tmp):
     code, out, err = cli([nohead] + base_args + sa)
     check(code == 64 and "not in the CSV" in err
           and "Larkspur" not in err + out and "412" not in err + out
-          and "Birch" not in err + out and "Fairview" in err
-          and "1 name(s) are not shown" in err,
+          and "Birch" not in err + out and "Fairview" not in err
+          and "2 column(s)" in err,
           "a file with no header row exits 64 and the first data row, a "
           "home address, is not printed  <-- pinned defect")
+    typed = tmpfile("typed.key", "Xk9fT2mQpL7vZ4rWc8Hd\n")
+    named = tmpfile("named.csv", "Jane Roe,412 Larkspur Lane\n")
+    code, out, err = cli([typed] + base_args + sa)
+    code2, out2, err2 = cli(["--build-roster", named, "--address-field",
+                             "HOME_ADDR", "--roster", path("n-r.txt"),
+                             "--key-file", key_path])
+    check(code == 64 == code2 and "Xk9f" not in err + out
+          and "Jane" not in err2 + out2 and "Roe" not in err2 + out2
+          and "1 column(s)" in err and "2 column(s)" in err2,
+          "a typed key passed as the dataset and a person's name in a "
+          "headerless plain list reach neither output  <-- pinned defect")
+    near = tmpfile("near.csv", "PARCEL,SITE_ADR\nP1,90 Birchwood Ct\n")
+    code, out, err = cli([near] + base_args + sa)
+    check(code == 64 and "Did you mean 'SITE_ADR'?" in err,
+          "a column name one edit off the typed one is offered")
+    code, out, err = cli([key_path, "--roster", roster_path, "--key-file",
+                          key_path] + sa)
+    code2, out2, err2 = cli(["--build-roster", key_path, "--address-field",
+                             "A", "--roster", path("k-r.txt"), "--key-file",
+                             key_path])
+    code3, out3, err3 = cli([roster_path, "--roster", roster_path,
+                             "--key-file", key_path] + sa)
+    check(code == 64 == code2 == code3 and "are the same file" in err
+          and "are the same file" in err2 and "are the same file" in err3
+          and out == "" and out2 == "" and out3 == "",
+          "the dataset or the plain list named as the key file or the roster "
+          "is refused before anything is read  <-- pinned defect")
     code, out, err = cli(run + ["--address-field", "NOPE"])
     check(code == 64 and "'NOPE' is not in the CSV" in err and out == "",
           "a wrong column name exits 64 and lists the real ones")
@@ -1705,7 +2056,7 @@ def _self_test(tmp):
     keep2 = tmpfile("precious2.txt", "PRECIOUS\n")
     code, out, err = cli(["--build-roster", plain_csv, "--address-field",
                           "HOME_ADDR", "--roster", keep2, "--key-file",
-                          key_path, "--apply"])
+                          key_path, "--apply", "--max-unchecked", "30"])
     check(code == 0 and "replaced %s" % keep2 in out,
           "an existing roster file is replaced, and the run says so")
     header_only = tmpfile("header-only.csv", "PARCEL,SITE_ADDR\n")
@@ -1733,7 +2084,8 @@ def _self_test(tmp):
 
     # ---- a prefix of any flag, the write flag first, is refused
     abbreviations = ("--ap", "--appl", "--app", "--rost", "--key", "--addr",
-                     "--rep", "--sel", "--make", "--build", "--sam", "--ou")
+                     "--rep", "--sel", "--make", "--build", "--sam", "--ou",
+                     "--max", "--max-un", "--max-unchecke")
     codes = []
     for flag in abbreviations:
         argv = run + sa + two_out + [flag]
@@ -1804,7 +2156,7 @@ def _self_test(tmp):
     code2, out2, err2 = cli([tail_data, "--roster", tail_roster, "--key-file",
                              key_path] + sa)
     check(code == 0 and "entries that went on after the street suffix: 2" in out
-          and "VERDICT: roster of 2 entries" in out
+          and "VERDICT: roster of 4 entries. Every plain row is on it" in out
           and code2 == 1 and "rows held back: 2" in out2,
           "a roster built from one-line addresses with a city and ZIP code "
           "holds the street-only dataset lines, instead of reading as clean  "
@@ -1827,13 +2179,32 @@ def _self_test(tmp):
         "4,124 Elm St", "4,-"))
     code, out, err = cli(["--build-roster", half_ok, "--address-field",
                           "HOME_ADDR", "--roster", path("half-r.txt"),
-                          "--key-file", key_path, "--apply"])
+                          "--key-file", key_path, "--apply",
+                          "--max-unchecked", "50"])
     code2, out2, err2 = cli(["--build-roster", half_bad, "--address-field",
                              "HOME_ADDR", "--roster", path("half-r2.txt"),
-                             "--key-file", key_path, "--apply"])
+                             "--key-file", key_path, "--apply",
+                             "--max-unchecked", "50"])
     check(code == 0 and os.path.exists(path("half-r.txt"))
           and code2 == 4 and not os.path.exists(path("half-r2.txt")),
-          "the build limit is exact: 5 unusable rows in 10 builds, 6 do not")
+          "the build limit is exact: 5 unusable rows in 10 builds with "
+          "--max-unchecked 50, and 6 do not")
+    code, out, err = cli(["--build-roster", half_ok, "--address-field",
+                          "HOME_ADDR", "--roster", path("half-r3.txt"),
+                          "--key-file", key_path, "--apply"])
+    check(code == 4 and "TOO LITTLE BUILT" in out
+          and "--max-unchecked allows 0 percent" in out
+          and not os.path.exists(path("half-r3.txt")),
+          "a plain list with even one row that has no street line builds "
+          "no roster until the loss is allowed  <-- pinned defect")
+    header_plain = tmpfile("header-plain.csv", "ID,HOME_ADDR\n")
+    code, out, err = cli(["--build-roster", header_plain, "--address-field",
+                          "HOME_ADDR", "--roster", path("hp.txt"),
+                          "--key-file", key_path, "--apply"])
+    check(code == 4 and "NOTHING BUILT" in out
+          and not os.path.exists(path("hp.txt")),
+          "a plain list with a header and no rows builds no empty roster  "
+          "<-- pinned defect")
     odd = tmpfile("odd.txt", "\n".join(roster_file.splitlines()[:1]
                                        + ["412 LARKSPUR LANE, FAIRVIEW"]
                                        + roster_file.splitlines()[2:]) + "\n")
@@ -1842,10 +2213,16 @@ def _self_test(tmp):
     check(code == 3 and "damaged" in out and "LARKSPUR" not in out + err,
           "a roster whose normalizer line holds text is refused without "
           "printing that text  <-- pinned defect")
+    code, out, err = cli(build + base_args)
+    check(code == 0 and "VERDICT: roster of 8 entries. 2 plain row(s) are NOT "
+          "on it" in out and "not needed" not in out,
+          "the build verdict states the number of entries and the rows left "
+          "out, and does not call the plain list unneeded  "
+          "<-- pinned defect")
     code, out, err = cli(["--build-roster", plain_csv, "--address-field",
                           "HOME_ADDR"] + base_args)
-    check(code == 0 and "VERDICT: roster of 4 entries." in out,
-          "the build verdict states the number of entries")
+    check(code == 4 and "TOO LITTLE BUILT" in out,
+          "a build that leaves 2 of 7 plain rows out exits 4 by default")
 
     # ---- the key file
     new_key = path("fresh.bin")
@@ -1857,7 +2234,8 @@ def _self_test(tmp):
         fresh = parse_key(handle.read())
     mode_ok = os.name == "nt" or (os.stat(new_key).st_mode & 0o077) == 0
     check(code == 0 and re.match(r"^[0-9a-f]{64}$", fresh.decode("ascii"))
-          and fresh.decode("ascii") not in out and mode_ok,
+          and fresh.decode("ascii") not in out and mode_ok
+          and out.startswith("wrote %s, 256 random bits." % new_key),
           "--make-key --apply writes 64 hex characters, owner-only where "
           "the system has modes, and never prints them")
     code, out, err = cli(["--make-key", new_key, "--apply"])
@@ -1993,6 +2371,7 @@ def _self_test(tmp):
     quiet = sys.stdout
     sys.stdout = io.StringIO()
     mark = len(failed)
+    label_mark = len(labels)
     try:
         check(False, "probe: a false condition must be recorded as a failure")
         raises(lambda: None, "probe: a call that raises nothing must fail")
@@ -2000,7 +2379,7 @@ def _self_test(tmp):
     finally:
         sys.stdout = quiet
     probe = failed[mark:]
-    del failed[mark:]
+    del failed[mark:], labels[label_mark:]
     check(len(probe) == 3,
           "check() and raises() really do record a failure  <-- pinned defect")
     raises(lambda: (_ for _ in ()).throw(ValueError("x")),
@@ -2040,6 +2419,9 @@ def _self_test(tmp):
     check(buf.getvalue() == "" and module.normalize("12 Oak Street") ==
           base_line, "importing the module prints nothing and exposes the core")
 
+    check(passed[0] == len(labels) - len(failed) and len(labels) > 200,
+          "the pass count is the number of checks made less the failures, so "
+          "the footer total is not off by one  <-- pinned defect")
     return summary(passed[0], failed)
 
 
